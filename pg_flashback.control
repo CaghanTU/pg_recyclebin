@@ -1,0 +1,5 @@
+comment = 'PostgreSQL Flashback Extension'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_flashback'
+relocatable = false
+superuser = true

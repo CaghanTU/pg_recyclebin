@@ -1,0 +1,23 @@
+[package]
+name = "pg_flashback"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pg_flashback"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "pgrx_embed_pg_flashback"
+path = "src/bin/pgrx_embed_pg_flashback.rs"
+
+[features]
+default = []
+pg17 = ["pgrx/pg17"]
+
+[dependencies]
+pgrx = { version = "0.16.1", default-features = false }
+chrono = "0.4"
+
+[dev-dependencies]
+pgrx-tests = "0.16.1"
