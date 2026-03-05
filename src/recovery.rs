@@ -12,39 +12,74 @@ fn flashback_restore(table_name: &str) -> bool {
     )) {
     Ok(Some(name)) => name,
     Ok(None) => {
-        pgrx::warning!("Tablo bulunamadı: {}", table_name);
+        pgrx::warning!("Table not found: {}", table_name);
         return false;
     }
     Err(e) => {
-        pgrx::warning!("Sorgu hatası: {}", e);
+        pgrx::warning!("Query error: {}", e);
         return false;
     }
     };
 
+     // Return error if target table already exists
+    if let Ok(Some(true)) = Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = '{}')",
+        table_name
+    )) {
+        pgrx::warning!("Target table already exists: {}", table_name);
+        return false;
+    }
+
     let sql = format!("ALTER TABLE flashback_recycle.{} SET SCHEMA public", recycled_name);
     match Spi::run(&sql) {
     Ok(_) => {
-        // Önce rename
+        // First rename
         let rename_sql = format!("ALTER TABLE public.{} RENAME TO {}", recycled_name, table_name);
         if let Err(e) = Spi::run(&rename_sql) {
-            pgrx::warning!("Rename hatası: {}", e);
+            pgrx::warning!("Rename error: {}", e);
             return false;
         }
         
-        // Sonra metadata güncelle
+        // Then update metadata
         let update_sql = format!(
             "UPDATE flashback.operations SET restored = true WHERE table_name = '{}' AND recycled_name = '{}'",
             table_name, recycled_name
         );
         if let Err(e) = Spi::run(&update_sql) {
-            pgrx::warning!("Güncelleme hatası: {}", e);
+            pgrx::warning!("Update error: {}", e);
         }
         true
     }
     Err(e) => {
-        pgrx::warning!("Geri yükleme hatası: {}", e);
+        pgrx::warning!("Restore error: {}", e);
         false
     }
 }
     
+}
+
+
+#[pg_extern]
+fn flashback_list_recycled_tables() -> TableIterator<'static, (name!(table_name, String), name!(recycled_name, String), name!(dropped_at, String), name!(role_name, String), name!(retention_until, String))> {
+    let mut results = Vec::new();
+    
+    let sql = "SELECT table_name, recycled_name, timestamp::text, role_name, retention_until::text 
+               FROM flashback.operations 
+               WHERE restored = false 
+               ORDER BY timestamp DESC";
+    
+    let _ = Spi::connect(|client| {
+        let tup_table = client.select(sql, None, &[])?;
+        for row in tup_table {
+            let table_name = row.get::<String>(1)?.unwrap_or_default();
+            let recycled_name = row.get::<String>(2)?.unwrap_or_default();
+            let dropped_at = row.get::<String>(3)?.unwrap_or_default();
+            let role_name = row.get::<String>(4)?.unwrap_or_default();
+            let retention_until = row.get::<String>(5)?.unwrap_or_default();
+            results.push((table_name, recycled_name, dropped_at, role_name, retention_until));
+        }
+        Ok::<_, spi::Error>(())
+    });
+    
+    TableIterator::new(results.into_iter())
 }
