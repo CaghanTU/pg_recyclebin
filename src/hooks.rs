@@ -42,17 +42,37 @@ unsafe extern "C-unwind" fn process_utility_hook(
     qc: *mut pg_sys::QueryCompletion,
 ) {
 
-   if let Some(query) = cstr_to_string(query_string) {
-    let upper = query.to_uppercase();
-    let is_drop_table = upper.contains("DROP") && upper.contains("TABLE");
-    let is_internal = upper.contains("FLASHBACK_RECYCLE") || upper.contains("FLASHBACK.OPERATIONS");
+   // Check AST node: only process actual DROP TABLE commands
+    let is_drop_table = unsafe {
+        if pstmt.is_null() {
+            false
+        } else {
+            let utility = (*pstmt).utilityStmt;
+            if utility.is_null() {
+                false
+            } else {
+                let tag = (*(utility as *mut pg_sys::Node)).type_;
+                if tag == pg_sys::NodeTag::T_DropStmt {
+                    let drop = utility as *mut pg_sys::DropStmt;
+                    (*drop).removeType == pg_sys::ObjectType::OBJECT_TABLE
+                } else {
+                    false
+                }
+            }
+        }
+    };
 
-    if is_drop_table && !is_internal {
-        if crate::ddl_capture::handle_drop_table(&query) {
-            return;
+    if is_drop_table {
+        if let Some(query) = cstr_to_string(query_string) {
+            let upper = query.to_uppercase();
+            let is_internal = upper.contains("FLASHBACK_RECYCLE") || upper.contains("FLASHBACK.OPERATIONS");
+            if !is_internal {
+                if crate::ddl_capture::handle_drop_table(&query) {
+                    return;
+                }
+            }
         }
     }
-}
     pgrx::log!("ProcessUtility hook called");
     
     // Chain to previous hook or standard function

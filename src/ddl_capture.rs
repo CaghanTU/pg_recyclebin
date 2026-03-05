@@ -61,11 +61,12 @@ pub fn handle_drop_table(query: &str) -> bool {
     enforce_size_limit();
 
     let table_name = query
-    .trim_end_matches(';')
-    .trim()
-    .split_whitespace()
-    .last()
-    .unwrap_or("");
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .split_whitespace()
+        .last()
+        .unwrap_or("");
 
     // Can be schema.table or just table
     let (schema, bare_table) = if table_name.contains('.') {
