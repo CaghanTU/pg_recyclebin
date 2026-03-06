@@ -2,13 +2,19 @@ use pgrx::prelude::*;
 
 #[pg_extern]
 
-fn flashback_restore(table_name: &str) -> bool {
+fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
     pgrx::log!("Restoring table: {}", table_name);
 
     // SQL injection protection
     if table_name.contains('\'') || table_name.contains(';') {
         pgrx::warning!("Invalid table name: {}", table_name);
         return false;
+    }
+    if let Some(s) = target_schema {
+        if s.contains('\'') || s.contains(';') {
+            pgrx::warning!("Invalid target schema: {}", s);
+            return false;
+        }
     }
 
     let (recycled_name, schema_name) = match Spi::get_two::<String, String>(&format!(
@@ -28,20 +34,23 @@ fn flashback_restore(table_name: &str) -> bool {
     }
     };
 
+    // target_schema verilmişse onu kullan, yoksa orijinal schema'ya geri dön
+    let restore_schema = target_schema.unwrap_or(&schema_name);
+
      // Return error if target table already exists
     if let Ok(Some(true)) = Spi::get_one::<bool>(&format!(
         "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname = '{}' AND tablename = '{}')",
-        schema_name, table_name
+        restore_schema, table_name
     )) {
         pgrx::warning!("Target table already exists: {}", table_name);
         return false;
     }
 
-    let sql = format!("ALTER TABLE flashback_recycle.{} SET SCHEMA {}", recycled_name, schema_name);
+    let sql = format!("ALTER TABLE flashback_recycle.{} SET SCHEMA {}", recycled_name, restore_schema);
     match Spi::run(&sql) {
     Ok(_) => {
         // First rename
-        let rename_sql = format!("ALTER TABLE {}.{} RENAME TO {}", schema_name, recycled_name, table_name);
+        let rename_sql = format!("ALTER TABLE {}.{} RENAME TO {}", restore_schema, recycled_name, table_name);
         if let Err(e) = Spi::run(&rename_sql) {
             pgrx::warning!("Rename error: {}", e);
             return false;
