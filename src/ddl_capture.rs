@@ -109,12 +109,12 @@ pub fn handle_drop_table(query: &str) -> bool {
     .unwrap_or(None)
     .unwrap_or_default();
 
-    if is_temp == "t" {
+    if is_temp == "t" || is_temp.is_empty() {
         return false;
     }
 
     pgrx::log!("Table name: {}.{}", schema, bare_table);
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
 
     let recycled_name = format!("{}_{}", bare_table, timestamp);
 
@@ -188,14 +188,14 @@ pub fn handle_truncate_table(query: &str) -> bool {
     .unwrap_or(None)
     .unwrap_or_default();
 
-    if is_temp == "t" {
+    if is_temp == "t" || is_temp.is_empty() {
         return false;
     }
 
     enforce_table_limit();
     enforce_size_limit();
 
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let recycled_name = format!("{}_{}", bare_table, timestamp);
 
     // Copy data into a new backup table in flashback_recycle schema
