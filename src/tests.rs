@@ -95,4 +95,44 @@ mod tests {
 
         cleanup();
     }
+
+    // Test 4: TRUNCATE captured and data restored correctly
+    #[pg_test]
+    fn test_truncate_capture_and_restore() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_trunc CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_trunc (id SERIAL, val text)").unwrap();
+        Spi::run("INSERT INTO test_trunc (val) VALUES ('x'), ('y'), ('z')").unwrap();
+
+        Spi::run("TRUNCATE TABLE test_trunc").unwrap();
+
+        // Should be in recycle bin as TRUNCATE
+        let op_type = Spi::get_one::<String>(
+            "SELECT operation_type FROM flashback.operations \
+             WHERE table_name = 'test_trunc' AND restored = false LIMIT 1"
+        ).unwrap().unwrap_or_default();
+        assert_eq!(op_type, "TRUNCATE", "TRUNCATE should be captured with correct operation_type");
+
+        // Restore
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_trunc', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "TRUNCATE restore should succeed");
+
+        // Data should be back
+        let row_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_trunc"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(row_count, 3, "All 3 rows should be restored after TRUNCATE");
+
+        // Sequence should continue from max id
+        Spi::run("INSERT INTO test_trunc (val) VALUES ('w')").unwrap();
+        let max_id = Spi::get_one::<i64>(
+            "SELECT MAX(id) FROM test_trunc"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(max_id, 4, "Sequence should continue from 4 after restore");
+
+        Spi::run("DROP TABLE IF EXISTS test_trunc CASCADE").unwrap();
+        Spi::run("DELETE FROM flashback.operations WHERE table_name = 'test_trunc'").unwrap();
+    }
 }

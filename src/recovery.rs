@@ -579,19 +579,19 @@ fn flashback_status() -> TableIterator<
 }
 
 #[pg_extern]
-fn flashback_list_recycled_tables() -> TableIterator<'static, (name!(schema_name, String), name!(table_name, String), name!(recycled_name, String), name!(dropped_at, String), name!(role_name, String), name!(retention_until, String), name!(op_id, i64))> {
+fn flashback_list_recycled_tables() -> TableIterator<'static, (name!(schema_name, String), name!(table_name, String), name!(recycled_name, String), name!(dropped_at, String), name!(role_name, String), name!(retention_until, String), name!(op_id, i64), name!(operation_type, String))> {
     let mut results = Vec::new();
     
     // Superuser sees all entries; regular users see only their own.
     // Use GetSessionUserId() so SECURITY DEFINER doesn't bypass the check.
     let is_superuser = unsafe { pg_sys::superuser_arg(pg_sys::GetSessionUserId()) };
     let sql = if is_superuser {
-        "SELECT schema_name, table_name, recycled_name, timestamp::text, role_name, retention_until::text, op_id \
+        "SELECT schema_name, table_name, recycled_name, timestamp::text, role_name, retention_until::text, op_id, operation_type \
          FROM flashback.operations \
          WHERE restored = false \
          ORDER BY timestamp DESC".to_string()
     } else {
-        "SELECT schema_name, table_name, recycled_name, timestamp::text, role_name, retention_until::text, op_id \
+        "SELECT schema_name, table_name, recycled_name, timestamp::text, role_name, retention_until::text, op_id, operation_type \
          FROM flashback.operations \
          WHERE restored = false AND role_name = current_user \
          ORDER BY timestamp DESC".to_string()
@@ -607,7 +607,8 @@ fn flashback_list_recycled_tables() -> TableIterator<'static, (name!(schema_name
             let role_name = row.get::<String>(5)?.unwrap_or_default();
             let retention_until = row.get::<String>(6)?.unwrap_or_default();
             let op_id = row.get::<i64>(7)?.unwrap_or_default();
-            results.push((schema_name, table_name, recycled_name, dropped_at, role_name, retention_until, op_id));
+            let operation_type = row.get::<String>(8)?.unwrap_or_default();
+            results.push((schema_name, table_name, recycled_name, dropped_at, role_name, retention_until, op_id, operation_type));
         }
         Ok::<_, spi::Error>(())
     });
