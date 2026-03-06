@@ -1,5 +1,36 @@
 use pgrx::prelude::*;
 
+/// Find (column_name, sequence_name) pairs for a table via pg_depend.
+/// Covers both SERIAL (deptype='a') and IDENTITY (deptype='i') columns.
+fn find_serial_sequences(schema: &str, table: &str) -> Vec<(String, String)> {
+    let mut cols = Vec::new();
+    let _ = pgrx::Spi::connect(|client| {
+        let rows = client.select(
+            &format!(
+                "SELECT a.attname, s.oid::regclass::text \
+                 FROM pg_class t \
+                 JOIN pg_namespace n ON n.oid = t.relnamespace \
+                 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum > 0 \
+                 JOIN pg_depend d ON d.refobjid = t.oid AND d.refobjsubid = a.attnum \
+                 JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
+                 WHERE t.relname = '{}' AND n.nspname = '{}' \
+                 AND d.deptype IN ('a', 'i')",
+                table, schema
+            ),
+            None, &[],
+        )?;
+        for row in rows {
+            let col = row.get::<String>(1)?.unwrap_or_default();
+            let seq = row.get::<String>(2)?.unwrap_or_default();
+            if !col.is_empty() && !seq.is_empty() {
+                cols.push((col, seq));
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(())
+    });
+    cols
+}
+
 #[pg_extern]
 
 fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
@@ -93,33 +124,7 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
     match Spi::run(&sql) {
         Ok(_) => {
             // Restore sequences to max values present in the restored data
-            let serial_cols: Vec<(String, String)> = {
-                let mut cols = Vec::new();
-                let _ = Spi::connect(|client| {
-                    let rows = client.select(
-                        &format!(
-                            "SELECT column_name, \
-                             pg_get_serial_sequence('{}.{}', column_name) \
-                             FROM information_schema.columns \
-                             WHERE table_schema = '{}' AND table_name = '{}' \
-                             AND column_default LIKE 'nextval%%' \
-                             AND pg_get_serial_sequence('{}.{}', column_name) IS NOT NULL",
-                            restore_schema, table_name, restore_schema, table_name,
-                            restore_schema, table_name
-                        ),
-                        None, &[],
-                    )?;
-                    for row in rows {
-                        let col = row.get::<String>(1)?.unwrap_or_default();
-                        let seq = row.get::<String>(2)?.unwrap_or_default();
-                        if !col.is_empty() && !seq.is_empty() {
-                            cols.push((col, seq));
-                        }
-                    }
-                    Ok::<_, spi::Error>(())
-                });
-                cols
-            };
+            let serial_cols = find_serial_sequences(restore_schema, table_name);
             for (col, seq) in &serial_cols {
                 if let Ok(Some(max_val)) = Spi::get_one::<i64>(
                     &format!("SELECT COALESCE(MAX(\"{}\"), 0)::bigint FROM \"{}\".\"{}\"" ,
@@ -240,33 +245,7 @@ fn flashback_restore_by_id(op_id: i64, target_schema: Option<&str>) -> bool {
     match Spi::run(&sql) {
         Ok(_) => {
             // Restore sequences to max values present in the restored data
-            let serial_cols: Vec<(String, String)> = {
-                let mut cols = Vec::new();
-                let _ = Spi::connect(|client| {
-                    let rows = client.select(
-                        &format!(
-                            "SELECT column_name, \
-                             pg_get_serial_sequence('{}.{}', column_name) \
-                             FROM information_schema.columns \
-                             WHERE table_schema = '{}' AND table_name = '{}' \
-                             AND column_default LIKE 'nextval%%' \
-                             AND pg_get_serial_sequence('{}.{}', column_name) IS NOT NULL",
-                            restore_schema, table_name, restore_schema, table_name,
-                            restore_schema, table_name
-                        ),
-                        None, &[],
-                    )?;
-                    for row in rows {
-                        let col = row.get::<String>(1)?.unwrap_or_default();
-                        let seq = row.get::<String>(2)?.unwrap_or_default();
-                        if !col.is_empty() && !seq.is_empty() {
-                            cols.push((col, seq));
-                        }
-                    }
-                    Ok::<_, spi::Error>(())
-                });
-                cols
-            };
+            let serial_cols = find_serial_sequences(restore_schema, &table_name);
             for (col, seq) in &serial_cols {
                 if let Ok(Some(max_val)) = Spi::get_one::<i64>(
                     &format!("SELECT COALESCE(MAX(\"{}\"), 0)::bigint FROM \"{}\".\"{}\"" ,
