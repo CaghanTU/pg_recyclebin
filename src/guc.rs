@@ -1,5 +1,5 @@
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 
 
 static RETENTION_DAYS: GucSetting<i32> = GucSetting::<i32>::new(7);

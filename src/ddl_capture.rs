@@ -144,3 +144,82 @@ pub fn handle_drop_table(query: &str) -> bool {
 
     true
 }
+
+pub fn handle_truncate_table(query: &str) -> bool {
+    // Extract table name: "TRUNCATE [TABLE] orders [CASCADE|RESTRICT|...]"
+    let table_name = query
+        .trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .filter(|w| {
+            let u = w.to_uppercase();
+            u != "TRUNCATE" && u != "TABLE" && u != "CASCADE"
+                && u != "RESTRICT" && u != "ONLY"
+        })
+        .next()
+        .unwrap_or("");
+
+    let (schema, bare_table) = if table_name.contains('.') {
+        let (s, t) = table_name.split_once('.').unwrap();
+        (s.to_string(), t.to_string())
+    } else {
+        ("public".to_string(), table_name.to_string())
+    };
+
+    if schema == "flashback" || schema == "flashback_recycle" || schema.starts_with("pg_temp") {
+        return false;
+    }
+
+    let excluded = crate::guc::get_excluded_schemas();
+    if excluded.iter().any(|s| s == &schema) {
+        return false;
+    }
+
+    if bare_table.contains('\'') || bare_table.contains(';') || schema.contains('\'') || schema.contains(';') {
+        pgrx::warning!("Invalid table or schema name in TRUNCATE");
+        return false;
+    }
+
+    // Check relpersistence — skip temp tables
+    let is_temp = Spi::get_one::<String>(&format!(
+        "SELECT relpersistence::text FROM pg_class WHERE relname = '{}' LIMIT 1",
+        bare_table
+    ))
+    .unwrap_or(None)
+    .unwrap_or_default();
+
+    if is_temp == "t" {
+        return false;
+    }
+
+    enforce_table_limit();
+    enforce_size_limit();
+
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let recycled_name = format!("{}_{}", bare_table, timestamp);
+
+    // Copy data into a new backup table in flashback_recycle schema
+    let create_sql = format!(
+        "CREATE TABLE flashback_recycle.{} AS SELECT * FROM {}.{}",
+        recycled_name, schema, bare_table
+    );
+
+    if let Err(e) = Spi::run(&create_sql) {
+        pgrx::warning!("TRUNCATE backup error: {}", e);
+        return false;
+    }
+
+    let insert_sql = format!(
+        "INSERT INTO flashback.operations (operation_type, schema_name, table_name, recycled_name, role_name, retention_until) \
+         VALUES ('TRUNCATE', '{}', '{}', '{}', current_user, now() + interval '{} days')",
+        schema, bare_table, recycled_name, guc::get_retention_days()
+    );
+
+    if let Err(e) = Spi::run(&insert_sql) {
+        pgrx::warning!("TRUNCATE metadata insert error: {}", e);
+        return false;
+    }
+
+    pgrx::log!("TRUNCATE captured: {}.{} -> {}", schema, bare_table, recycled_name);
+    false  // false = don't suppress the actual TRUNCATE, let PostgreSQL execute it
+}

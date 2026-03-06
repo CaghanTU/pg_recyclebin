@@ -61,6 +61,20 @@ unsafe extern "C-unwind" fn process_utility_hook(
         }
     };
 
+    let is_truncate = unsafe {
+        if pstmt.is_null() {
+            false
+        } else {
+            let utility = (*pstmt).utilityStmt;
+            if utility.is_null() {
+                false
+            } else {
+                let tag = (*(utility as *mut pg_sys::Node)).type_;
+                tag == pg_sys::NodeTag::T_TruncateStmt
+            }
+        }
+    };
+
     if is_drop_table {
         if let Some(query) = cstr_to_string(query_string) {
             let upper = query.to_uppercase();
@@ -72,6 +86,19 @@ unsafe extern "C-unwind" fn process_utility_hook(
             }
         }
     }
+    
+    if is_truncate {
+        if let Some(query) = cstr_to_string(query_string) {
+            let upper = query.to_uppercase();
+            let is_internal = upper.contains("FLASHBACK_RECYCLE") || upper.contains("FLASHBACK.OPERATIONS");
+            if !is_internal {
+                if crate::ddl_capture::handle_truncate_table(&query) {
+                    return;
+                }
+            }
+        }
+    }
+    
     if let Some(prev) = PREV_PROCESS_UTILITY {
         prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
     } else {

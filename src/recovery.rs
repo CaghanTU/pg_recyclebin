@@ -17,12 +17,12 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
         }
     }
 
-    let (recycled_name, schema_name, role_name) = {
+    let (recycled_name, schema_name, role_name, operation_type) = {
         let mut found = None;
         let _ = Spi::connect(|client| {
             let rows = client.select(
                 &format!(
-                    "SELECT recycled_name, schema_name, role_name \
+                    "SELECT recycled_name, schema_name, role_name, operation_type \
                      FROM flashback.operations \
                      WHERE table_name = '{}' AND restored = false \
                      ORDER BY timestamp DESC LIMIT 1",
@@ -35,7 +35,8 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
                 let r = row.get::<String>(1)?.unwrap_or_default();
                 let s = row.get::<String>(2)?.unwrap_or_default();
                 let o = row.get::<String>(3)?.unwrap_or_default();
-                found = Some((r, s, o));
+                let op = row.get::<String>(4)?.unwrap_or_default();
+                found = Some((r, s, o, op));
             }
             Ok::<_, spi::Error>(())
         });
@@ -69,6 +70,32 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
 
     let restore_schema = target_schema.unwrap_or(&schema_name);
 
+    if operation_type == "TRUNCATE" {
+    // Table still exists, restore data back into it
+    let sql = format!(
+        "INSERT INTO {}.{} SELECT * FROM flashback_recycle.{}",
+        restore_schema, table_name, recycled_name
+    );
+    match Spi::run(&sql) {
+        Ok(_) => {
+            let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{}", recycled_name);
+            let _ = Spi::run(&drop_sql);
+            let update_sql = format!(
+                "UPDATE flashback.operations SET restored = true \
+                 WHERE table_name = '{}' AND recycled_name = '{}' AND restored = false",
+                table_name, recycled_name
+            );
+            let _ = Spi::run(&update_sql);
+            return true;
+        }
+        Err(e) => {
+            pgrx::warning!("TRUNCATE restore error: {}", e);
+            return false;
+        }
+    }
+}
+
+    // operation_type == "DROP" — existing logic below
     if let Ok(Some(true)) = Spi::get_one::<bool>(&format!(
         "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname = '{}' AND tablename = '{}')",
         restore_schema, table_name
@@ -102,12 +129,12 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
 
 #[pg_extern]
 fn flashback_restore_by_id(op_id: i64, target_schema: Option<&str>) -> bool {
-    let (recycled_name, table_name, schema_name, role_name) = {
+    let (recycled_name, table_name, schema_name, role_name, operation_type) = {
         let mut found = None;
         let _ = Spi::connect(|client| {
             let rows = client.select(
                 &format!(
-                    "SELECT recycled_name, table_name, schema_name, role_name \
+                    "SELECT recycled_name, table_name, schema_name, role_name, operation_type \
                      FROM flashback.operations \
                      WHERE op_id = {} AND restored = false",
                     op_id
@@ -120,7 +147,8 @@ fn flashback_restore_by_id(op_id: i64, target_schema: Option<&str>) -> bool {
                 let t = row.get::<String>(2)?.unwrap_or_default();
                 let s = row.get::<String>(3)?.unwrap_or_default();
                 let o = row.get::<String>(4)?.unwrap_or_default();
-                found = Some((r, t, s, o));
+                let op = row.get::<String>(5)?.unwrap_or_default();
+                found = Some((r, t, s, o, op));
             }
             Ok::<_, spi::Error>(())
         });
@@ -151,6 +179,32 @@ fn flashback_restore_by_id(op_id: i64, target_schema: Option<&str>) -> bool {
 
     let restore_schema = target_schema.unwrap_or(&schema_name);
 
+    if operation_type == "TRUNCATE" {
+    // Table still exists, restore data back into it
+    let sql = format!(
+        "INSERT INTO {}.{} SELECT * FROM flashback_recycle.{}",
+        restore_schema, table_name, recycled_name
+    );
+    match Spi::run(&sql) {
+        Ok(_) => {
+            let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{}", recycled_name);
+            let _ = Spi::run(&drop_sql);
+            let update_sql = format!(
+                "UPDATE flashback.operations SET restored = true \
+                 WHERE table_name = '{}' AND recycled_name = '{}' AND restored = false",
+                table_name, recycled_name
+            );
+            let _ = Spi::run(&update_sql);
+            return true;
+        }
+        Err(e) => {
+            pgrx::warning!("TRUNCATE restore error: {}", e);
+            return false;
+        }
+    }
+}
+
+    // operation_type == "DROP" — existing logic below
     if let Ok(Some(true)) = Spi::get_one::<bool>(&format!(
         "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname = '{}' AND tablename = '{}')",
         restore_schema, table_name
@@ -255,6 +309,58 @@ fn flashback_purge(table_name: &str) -> bool {
 
     pgrx::log!("Purged '{}' from recycle bin", table_name);
     true
+}
+
+#[pg_extern]
+fn flashback_purge_all() -> i64 {
+    let is_super = unsafe { pg_sys::superuser_arg(pg_sys::GetSessionUserId()) };
+
+    let session_user = if !is_super {
+        Spi::get_one::<String>("SELECT session_user")
+            .unwrap_or(None)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let filter = if is_super {
+        "WHERE restored = false".to_string()
+    } else {
+        format!("WHERE restored = false AND role_name = '{}'", session_user)
+    };
+
+    let mut recycled_names: Vec<String> = Vec::new();
+    let _ = Spi::connect(|client| {
+        let rows = client.select(
+            &format!("SELECT recycled_name FROM flashback.operations {}", filter),
+            None,
+            &[],
+        )?;
+        for row in rows {
+            if let Ok(Some(name)) = row.get::<String>(1) {
+                recycled_names.push(name);
+            }
+        }
+        Ok::<_, spi::Error>(())
+    });
+
+    let count = recycled_names.len() as i64;
+
+    for name in &recycled_names {
+        let sql = format!("DROP TABLE IF EXISTS flashback_recycle.{} CASCADE", name);
+        if let Err(e) = Spi::run(&sql) {
+            pgrx::warning!("Failed to drop '{}': {}", name, e);
+        }
+    }
+
+    if let Err(e) = Spi::run(&format!(
+        "DELETE FROM flashback.operations {}",
+        filter
+    )) {
+        pgrx::warning!("Failed to delete operations: {}", e);
+    }
+
+    count
 }
 
 #[pg_extern]
