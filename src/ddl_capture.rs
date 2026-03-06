@@ -92,6 +92,7 @@ pub fn handle_drop_table(query: &str) -> bool {
         pgrx::warning!("Invalid schema name: {}", schema);
         return false;
     }
+    
     // Gerçek tablo tipini pg_class'tan kontrol et
     // relpersistence = 't' ise temp table, atla
     let is_temp = Spi::get_one::<String>(&format!(
