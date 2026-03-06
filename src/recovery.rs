@@ -67,10 +67,10 @@ fn flashback_restore(table_name: &str) -> bool {
 
 
 #[pg_extern]
-fn flashback_list_recycled_tables() -> TableIterator<'static, (name!(table_name, String), name!(recycled_name, String), name!(dropped_at, String), name!(role_name, String), name!(retention_until, String))> {
+fn flashback_list_recycled_tables() -> TableIterator<'static, (name!(schema_name, String), name!(table_name, String), name!(recycled_name, String), name!(dropped_at, String), name!(role_name, String), name!(retention_until, String))> {
     let mut results = Vec::new();
     
-    let sql = "SELECT table_name, recycled_name, timestamp::text, role_name, retention_until::text 
+    let sql = "SELECT schema_name, table_name, recycled_name, timestamp::text, role_name, retention_until::text 
                FROM flashback.operations 
                WHERE restored = false 
                ORDER BY timestamp DESC";
@@ -78,12 +78,13 @@ fn flashback_list_recycled_tables() -> TableIterator<'static, (name!(table_name,
     let _ = Spi::connect(|client| {
         let tup_table = client.select(sql, None, &[])?;
         for row in tup_table {
-            let table_name = row.get::<String>(1)?.unwrap_or_default();
-            let recycled_name = row.get::<String>(2)?.unwrap_or_default();
-            let dropped_at = row.get::<String>(3)?.unwrap_or_default();
-            let role_name = row.get::<String>(4)?.unwrap_or_default();
-            let retention_until = row.get::<String>(5)?.unwrap_or_default();
-            results.push((table_name, recycled_name, dropped_at, role_name, retention_until));
+            let schema_name = row.get::<String>(1)?.unwrap_or_default();
+            let table_name = row.get::<String>(2)?.unwrap_or_default();
+            let recycled_name = row.get::<String>(3)?.unwrap_or_default();
+            let dropped_at = row.get::<String>(4)?.unwrap_or_default();
+            let role_name = row.get::<String>(5)?.unwrap_or_default();
+            let retention_until = row.get::<String>(6)?.unwrap_or_default();
+            results.push((schema_name, table_name, recycled_name, dropped_at, role_name, retention_until));
         }
         Ok::<_, spi::Error>(())
     });
