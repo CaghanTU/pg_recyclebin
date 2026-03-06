@@ -25,7 +25,8 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
                     "SELECT recycled_name, schema_name, role_name, operation_type \
                      FROM flashback.operations \
                      WHERE table_name = '{}' AND restored = false \
-                     ORDER BY timestamp DESC LIMIT 1",
+                     ORDER BY timestamp DESC LIMIT 1 \
+                     FOR UPDATE",
                     table_name
                 ),
                 None,
@@ -136,7 +137,8 @@ fn flashback_restore_by_id(op_id: i64, target_schema: Option<&str>) -> bool {
                 &format!(
                     "SELECT recycled_name, table_name, schema_name, role_name, operation_type \
                      FROM flashback.operations \
-                     WHERE op_id = {} AND restored = false",
+                     WHERE op_id = {} AND restored = false \
+                     FOR UPDATE",
                     op_id
                 ),
                 None,

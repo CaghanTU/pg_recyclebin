@@ -1,5 +1,4 @@
 use pgrx::prelude::*;
-use chrono::Local;
 use crate::guc;
 
 // Deletes the oldest table in the recycle bin (both the physical table and the operations record)
@@ -114,31 +113,45 @@ pub fn handle_drop_table(query: &str) -> bool {
     }
 
     pgrx::log!("Table name: {}.{}", schema, bare_table);
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
 
-    let recycled_name = format!("{}_{}", bare_table, timestamp);
+    // Reserve a unique op_id first; use it as the recycled_name suffix to guarantee uniqueness.
+    let reserve_sql = format!(
+        "INSERT INTO flashback.operations \
+         (operation_type, schema_name, table_name, recycled_name, role_name, retention_until) \
+         VALUES ('DROP', '{}', '{}', '', current_user, now() + interval '{} days') \
+         RETURNING op_id",
+        schema, bare_table, guc::get_retention_days()
+    );
+    let op_id = match Spi::get_one::<i64>(&reserve_sql) {
+        Ok(Some(id)) => id,
+        _ => {
+            pgrx::warning!("Failed to reserve op_id for '{}'", bare_table);
+            return false;
+        }
+    };
+
+    let recycled_name = format!("{}_{}", bare_table, op_id);
 
     let move_sql = format!("ALTER TABLE {}.{} SET SCHEMA flashback_recycle", schema, bare_table);
     let rename_sql = format!("ALTER TABLE flashback_recycle.{} RENAME TO {}", bare_table, recycled_name);
 
     if let Err(e) = Spi::run(&move_sql) {
-    pgrx::warning!("Move error: {}", e);
-    return false;
+        pgrx::warning!("Move error: {}", e);
+        let _ = Spi::run(&format!("DELETE FROM flashback.operations WHERE op_id = {}", op_id));
+        return false;
     }
 
     if let Err(e) = Spi::run(&rename_sql) {
-    pgrx::warning!("Rename error: {}", e);
-    return false;
+        pgrx::warning!("Rename error: {}", e);
+        let _ = Spi::run(&format!("DELETE FROM flashback.operations WHERE op_id = {}", op_id));
+        return false;
     }
 
-    let insert_sql = format!(
-    "INSERT INTO flashback.operations (operation_type, schema_name, table_name, recycled_name, role_name, retention_until)
-     VALUES ('DROP', '{}', '{}', '{}', current_user, now() + interval '{} days')",
-    schema, bare_table, recycled_name, guc::get_retention_days()
-    );
-
-    if let Err(e) = Spi::run(&insert_sql) {
-        pgrx::warning!("Insertion error: {}", e);
+    if let Err(e) = Spi::run(&format!(
+        "UPDATE flashback.operations SET recycled_name = '{}' WHERE op_id = {}",
+        recycled_name, op_id
+    )) {
+        pgrx::warning!("Failed to update recycled_name: {}", e);
         return false;
     }
 
@@ -195,8 +208,23 @@ pub fn handle_truncate_table(query: &str) -> bool {
     enforce_table_limit();
     enforce_size_limit();
 
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let recycled_name = format!("{}_{}", bare_table, timestamp);
+    // Reserve a unique op_id first; use it as the recycled_name suffix to guarantee uniqueness.
+    let reserve_sql = format!(
+        "INSERT INTO flashback.operations \
+         (operation_type, schema_name, table_name, recycled_name, role_name, retention_until) \
+         VALUES ('TRUNCATE', '{}', '{}', '', current_user, now() + interval '{} days') \
+         RETURNING op_id",
+        schema, bare_table, guc::get_retention_days()
+    );
+    let op_id = match Spi::get_one::<i64>(&reserve_sql) {
+        Ok(Some(id)) => id,
+        _ => {
+            pgrx::warning!("Failed to reserve op_id for TRUNCATE of '{}'", bare_table);
+            return false;
+        }
+    };
+
+    let recycled_name = format!("{}_{}", bare_table, op_id);
 
     // Copy data into a new backup table in flashback_recycle schema
     let create_sql = format!(
@@ -206,17 +234,15 @@ pub fn handle_truncate_table(query: &str) -> bool {
 
     if let Err(e) = Spi::run(&create_sql) {
         pgrx::warning!("TRUNCATE backup error: {}", e);
+        let _ = Spi::run(&format!("DELETE FROM flashback.operations WHERE op_id = {}", op_id));
         return false;
     }
 
-    let insert_sql = format!(
-        "INSERT INTO flashback.operations (operation_type, schema_name, table_name, recycled_name, role_name, retention_until) \
-         VALUES ('TRUNCATE', '{}', '{}', '{}', current_user, now() + interval '{} days')",
-        schema, bare_table, recycled_name, guc::get_retention_days()
-    );
-
-    if let Err(e) = Spi::run(&insert_sql) {
-        pgrx::warning!("TRUNCATE metadata insert error: {}", e);
+    if let Err(e) = Spi::run(&format!(
+        "UPDATE flashback.operations SET recycled_name = '{}' WHERE op_id = {}",
+        recycled_name, op_id
+    )) {
+        pgrx::warning!("TRUNCATE metadata update error: {}", e);
         return false;
     }
 
