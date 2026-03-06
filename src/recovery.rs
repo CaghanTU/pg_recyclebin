@@ -34,7 +34,7 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
     }
     };
 
-    // target_schema verilmişse onu kullan, yoksa orijinal schema'ya geri dön
+    // if target_schema is provided, use it; otherwise, restore to original schema
     let restore_schema = target_schema.unwrap_or(&schema_name);
 
      // Return error if target table already exists
@@ -70,10 +70,113 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
         pgrx::warning!("Restore error: {}", e);
         false
     }
-}
-    
+}}
+
+#[pg_extern]
+fn flashback_purge(table_name: &str) -> bool {
+    // SQL injection protection
+    if table_name.contains('\'') || table_name.contains(';') {
+        pgrx::warning!("Invalid table name: {}", table_name);
+        return false;
+    }
+
+    // Find the most recently dropped entry for this table
+    let recycled_name = match Spi::get_one::<String>(&format!(
+        "SELECT recycled_name FROM flashback.operations \
+         WHERE table_name = '{}' AND restored = false \
+         ORDER BY timestamp DESC LIMIT 1",
+        table_name
+    )) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            pgrx::warning!("Table not found in recycle bin: {}", table_name);
+            return false;
+        }
+        Err(e) => {
+            pgrx::warning!("Query error: {}", e);
+            return false;
+        }
+    };
+
+    // Drop the physical table from the recycle bin schema
+    let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{} CASCADE", recycled_name);
+    if let Err(e) = Spi::run(&drop_sql) {
+        pgrx::warning!("Failed to drop recycled table '{}': {}", recycled_name, e);
+        return false;
+    }
+
+    // Remove the metadata record
+    let delete_sql = format!(
+        "DELETE FROM flashback.operations WHERE recycled_name = '{}' AND restored = false",
+        recycled_name
+    );
+    if let Err(e) = Spi::run(&delete_sql) {
+        pgrx::warning!("Failed to delete metadata for '{}': {}", table_name, e);
+        return false;
+    }
+
+    pgrx::log!("Purged '{}' from recycle bin", table_name);
+    true
 }
 
+#[pg_extern]
+fn flashback_status() -> TableIterator<
+    'static,
+    (
+        name!(table_count, i64),
+        name!(table_limit, i32),
+        name!(total_size_bytes, i64),
+        name!(size_limit_mb, i32),
+        name!(retention_days, i32),
+        name!(worker_interval_seconds, i32),
+        name!(oldest_entry, String),
+        name!(newest_entry, String),
+    ),
+> {
+    let table_count = Spi::get_one::<i64>(
+        "SELECT COUNT(*)::bigint FROM flashback.operations WHERE restored = false",
+    )
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
+    let total_size_bytes = Spi::get_one::<i64>(
+        "SELECT COALESCE(SUM(pg_total_relation_size(format('flashback_recycle.%I', recycled_name))), 0)::bigint \
+         FROM flashback.operations WHERE restored = false",
+    )
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
+    let oldest_entry = Spi::get_one::<String>(
+        "SELECT MIN(timestamp)::text FROM flashback.operations WHERE restored = false",
+    )
+    .unwrap_or(None)
+    .unwrap_or_else(|| "-".to_string());
+
+    let newest_entry = Spi::get_one::<String>(
+        "SELECT MAX(timestamp)::text FROM flashback.operations WHERE restored = false",
+    )
+    .unwrap_or(None)
+    .unwrap_or_else(|| "-".to_string());
+
+    let table_limit = crate::guc::get_max_tables();
+    let size_limit_mb = crate::guc::get_max_size();
+    let retention_days = crate::guc::get_retention_days();
+    let worker_interval_seconds = crate::guc::worker_interval_seconds();
+
+    TableIterator::new(
+        vec![(
+            table_count,
+            table_limit,
+            total_size_bytes,
+            size_limit_mb,
+            retention_days,
+            worker_interval_seconds,
+            oldest_entry,
+            newest_entry,
+        )]
+        .into_iter(),
+    )
+}
 
 #[pg_extern]
 fn flashback_list_recycled_tables() -> TableIterator<'static, (name!(schema_name, String), name!(table_name, String), name!(recycled_name, String), name!(dropped_at, String), name!(role_name, String), name!(retention_until, String))> {
