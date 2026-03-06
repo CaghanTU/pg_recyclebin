@@ -17,22 +17,55 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
         }
     }
 
-    let (recycled_name, schema_name) = match Spi::get_two::<String, String>(&format!(
-    "SELECT recycled_name, schema_name FROM flashback.operations 
-     WHERE table_name = '{}' AND restored = false 
-     ORDER BY timestamp DESC LIMIT 1",
-    table_name
-    )) {
-    Ok((Some(r), Some(s))) => (r, s),
-    Ok(_) => {
-        pgrx::warning!("Table not found: {}", table_name);
-        return false;
-    }
-    Err(e) => {
-        pgrx::warning!("Query error: {}", e);
-        return false;
-    }
+    let (recycled_name, schema_name, role_name) = {
+        let mut found = None;
+        let _ = Spi::connect(|client| {
+            let rows = client.select(
+                &format!(
+                    "SELECT recycled_name, schema_name, role_name \
+                     FROM flashback.operations \
+                     WHERE table_name = '{}' AND restored = false \
+                     ORDER BY timestamp DESC LIMIT 1",
+                    table_name
+                ),
+                None,
+                &[],
+            )?;
+            for row in rows {
+                let r = row.get::<String>(1)?.unwrap_or_default();
+                let s = row.get::<String>(2)?.unwrap_or_default();
+                let o = row.get::<String>(3)?.unwrap_or_default();
+                found = Some((r, s, o));
+            }
+            Ok::<_, spi::Error>(())
+        });
+        match found {
+            Some(t) => t,
+            None => {
+                pgrx::warning!("Table not found in recycle bin: {}", table_name);
+                return false;
+            }
+        }
     };
+
+    // Permission check: only the original owner or a superuser can restore.
+    // Use GetSessionUserId() + superuser_arg() so SECURITY DEFINER doesn't
+    // bypass the check (superuser() checks the effective user, not session user).
+    let is_session_superuser = unsafe {
+        pg_sys::superuser_arg(pg_sys::GetSessionUserId())
+    };
+    if !is_session_superuser {
+        let session_user = Spi::get_one::<String>("SELECT session_user")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        if session_user != role_name {
+            pgrx::warning!(
+                "Permission denied: table '{}' was dropped by '{}'",
+                table_name, role_name
+            );
+            return false;
+        }
+    }
 
     // if target_schema is provided, use it; otherwise, restore to original schema
     let restore_schema = target_schema.unwrap_or(&schema_name);
@@ -81,22 +114,52 @@ fn flashback_purge(table_name: &str) -> bool {
     }
 
     // Find the most recently dropped entry for this table
-    let recycled_name = match Spi::get_one::<String>(&format!(
-        "SELECT recycled_name FROM flashback.operations \
-         WHERE table_name = '{}' AND restored = false \
-         ORDER BY timestamp DESC LIMIT 1",
-        table_name
-    )) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            pgrx::warning!("Table not found in recycle bin: {}", table_name);
-            return false;
-        }
-        Err(e) => {
-            pgrx::warning!("Query error: {}", e);
-            return false;
+    let (recycled_name, role_name) = {
+        let mut found = None;
+        let _ = Spi::connect(|client| {
+            let rows = client.select(
+                &format!(
+                    "SELECT recycled_name, role_name \
+                     FROM flashback.operations \
+                     WHERE table_name = '{}' AND restored = false \
+                     ORDER BY timestamp DESC LIMIT 1",
+                    table_name
+                ),
+                None,
+                &[],
+            )?;
+            for row in rows {
+                let r = row.get::<String>(1)?.unwrap_or_default();
+                let o = row.get::<String>(2)?.unwrap_or_default();
+                found = Some((r, o));
+            }
+            Ok::<_, spi::Error>(())
+        });
+        match found {
+            Some(t) => t,
+            None => {
+                pgrx::warning!("Table not found in recycle bin: {}", table_name);
+                return false;
+            }
         }
     };
+
+    // Permission check: only the original owner or a superuser can purge.
+    let is_session_superuser = unsafe {
+        pg_sys::superuser_arg(pg_sys::GetSessionUserId())
+    };
+    if !is_session_superuser {
+        let session_user = Spi::get_one::<String>("SELECT session_user")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        if session_user != role_name {
+            pgrx::warning!(
+                "Permission denied: table '{}' was dropped by '{}'",
+                table_name, role_name
+            );
+            return false;
+        }
+    }
 
     // Drop the physical table from the recycle bin schema
     let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{} CASCADE", recycled_name);
@@ -182,13 +245,23 @@ fn flashback_status() -> TableIterator<
 fn flashback_list_recycled_tables() -> TableIterator<'static, (name!(schema_name, String), name!(table_name, String), name!(recycled_name, String), name!(dropped_at, String), name!(role_name, String), name!(retention_until, String))> {
     let mut results = Vec::new();
     
-    let sql = "SELECT schema_name, table_name, recycled_name, timestamp::text, role_name, retention_until::text 
-               FROM flashback.operations 
-               WHERE restored = false 
-               ORDER BY timestamp DESC";
+    // Superuser sees all entries; regular users see only their own.
+    // Use GetSessionUserId() so SECURITY DEFINER doesn't bypass the check.
+    let is_superuser = unsafe { pg_sys::superuser_arg(pg_sys::GetSessionUserId()) };
+    let sql = if is_superuser {
+        "SELECT schema_name, table_name, recycled_name, timestamp::text, role_name, retention_until::text \
+         FROM flashback.operations \
+         WHERE restored = false \
+         ORDER BY timestamp DESC".to_string()
+    } else {
+        "SELECT schema_name, table_name, recycled_name, timestamp::text, role_name, retention_until::text \
+         FROM flashback.operations \
+         WHERE restored = false AND role_name = current_user \
+         ORDER BY timestamp DESC".to_string()
+    };
     
     let _ = Spi::connect(|client| {
-        let tup_table = client.select(sql, None, &[])?;
+        let tup_table = client.select(&sql, None, &[])?;
         for row in tup_table {
             let schema_name = row.get::<String>(1)?.unwrap_or_default();
             let table_name = row.get::<String>(2)?.unwrap_or_default();

@@ -76,6 +76,13 @@ pub fn handle_drop_table(query: &str) -> bool {
         ("public".to_string(), table_name.to_string())
     };
 
+    // Skip tables in our own managed schemas (e.g. CASCADE drops triggered by
+    // DROP EXTENSION, or internal operations). This is more reliable than
+    // checking the query string text.
+    if schema == "flashback" || schema == "flashback_recycle" {
+        return false;
+    }
+
     // SQL injection protection
     if bare_table.contains('\'') || bare_table.contains(';') {
         pgrx::warning!("Invalid table name: {}", bare_table);
