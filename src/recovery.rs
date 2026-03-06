@@ -400,6 +400,74 @@ fn flashback_purge(table_name: &str) -> bool {
 }
 
 #[pg_extern]
+fn flashback_purge_by_id(op_id: i64) -> bool {
+    // Look up the entry
+    let (recycled_name, role_name) = {
+        let mut found = None;
+        let _ = Spi::connect(|client| {
+            let rows = client.select(
+                &format!(
+                    "SELECT recycled_name, role_name \
+                     FROM flashback.operations \
+                     WHERE op_id = {} AND restored = false",
+                    op_id
+                ),
+                None,
+                &[],
+            )?;
+            for row in rows {
+                let r = row.get::<String>(1)?.unwrap_or_default();
+                let o = row.get::<String>(2)?.unwrap_or_default();
+                found = Some((r, o));
+            }
+            Ok::<_, spi::Error>(())
+        });
+        match found {
+            Some(t) => t,
+            None => {
+                pgrx::warning!("op_id {} not found in recycle bin", op_id);
+                return false;
+            }
+        }
+    };
+
+    // Permission check
+    let is_session_superuser = unsafe { pg_sys::superuser_arg(pg_sys::GetSessionUserId()) };
+    if !is_session_superuser {
+        let session_user = Spi::get_one::<String>("SELECT session_user")
+            .unwrap_or(None)
+            .unwrap_or_default();
+        if session_user != role_name {
+            pgrx::warning!("Permission denied: op_id {} was created by '{}'", op_id, role_name);
+            return false;
+        }
+    }
+
+    let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{} CASCADE", recycled_name);
+    if let Err(e) = Spi::run(&drop_sql) {
+        pgrx::warning!("Failed to drop '{}': {}", recycled_name, e);
+        return false;
+    }
+
+    let delete_sql = format!(
+        "DELETE FROM flashback.operations WHERE op_id = {} AND restored = false",
+        op_id
+    );
+    if let Err(e) = Spi::run(&delete_sql) {
+        pgrx::warning!("Failed to delete metadata for op_id {}: {}", op_id, e);
+        return false;
+    }
+
+    pgrx::log!("Purged op_id {} from recycle bin", op_id);
+    true
+}
+
+#[pg_extern]
+fn flashback_restore_table(table_name: &str) -> bool {
+    flashback_restore(table_name, None)
+}
+
+#[pg_extern]
 fn flashback_purge_all() -> i64 {
     let is_super = unsafe { pg_sys::superuser_arg(pg_sys::GetSessionUserId()) };
 
