@@ -22,8 +22,4 @@ pub extern "C-unwind" fn _PG_fini() {
     pgrx::log!("pg_flashback unloaded");
 }
 
-#[pg_extern]
-fn flashback_hello() -> &'static str {
-    "pg_flashback loaded"
-}
 

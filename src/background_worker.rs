@@ -22,10 +22,8 @@ pub extern "C-unwind" fn flashback_cleanup_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
     pgrx::log!("Flashback Auto-Cleanup Worker started");
-
-    let check_interval_seconds: u64 = 3600; // 1 saat
     
-    while BackgroundWorker::wait_latch(Some(Duration::from_secs(check_interval_seconds))) {
+    while BackgroundWorker::wait_latch(Some(Duration::from_secs(crate::guc::worker_interval_seconds() as u64))) {
         // Check if we received SIGHUP (config reload)
         if BackgroundWorker::sighup_received() {
             // Reload configuration

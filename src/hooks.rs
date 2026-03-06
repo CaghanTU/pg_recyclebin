@@ -73,8 +73,6 @@ unsafe extern "C-unwind" fn process_utility_hook(
             }
         }
     }
-    pgrx::log!("ProcessUtility hook called");
-    
     // Chain to previous hook or standard function
     if let Some(prev) = PREV_PROCESS_UTILITY {
         prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);

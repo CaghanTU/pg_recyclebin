@@ -4,14 +4,14 @@ use crate::guc;
 
 // Deletes the oldest table in the recycle bin (both the physical table and the operations record)
 fn evict_oldest() {
-    let find_sql = "SELECT recycled_name FROM flashback.operations ORDER BY retention_until ASC LIMIT 1";
+    let find_sql = "SELECT recycled_name FROM flashback.operations WHERE restored = false ORDER BY retention_until ASC LIMIT 1";
 
     let oldest = Spi::get_one::<String>(find_sql);
 
     match oldest {
         Ok(Some(recycled_name)) => {
             let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{}", recycled_name);
-            let delete_sql = format!("DELETE FROM flashback.operations WHERE recycled_name = '{}'", recycled_name);
+            let delete_sql = format!("DELETE FROM flashback.operations WHERE recycled_name = '{}' AND restored = false", recycled_name);
 
             if let Err(e) = Spi::run(&drop_sql) {
                 pgrx::warning!("Evict drop error: {}", e);
@@ -31,7 +31,7 @@ fn evict_oldest() {
 
 // If table count exceeds max_tables, delete the oldest
 fn enforce_table_limit() {
-    let count_sql = "SELECT COUNT(*)::int FROM flashback.operations";
+    let count_sql = "SELECT COUNT(*)::int FROM flashback.operations WHERE restored = false";
 
     if let Ok(Some(count)) = Spi::get_one::<i32>(count_sql) {
         let max = guc::get_max_tables();
