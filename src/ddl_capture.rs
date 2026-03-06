@@ -80,9 +80,7 @@ pub fn handle_drop_table(query: &str) -> bool {
         ("public".to_string(), table_name.to_string())
     };
 
-    // Skip tables in our own managed schemas (e.g. CASCADE drops triggered by
-    // DROP EXTENSION, or internal operations). This is more reliable than
-    // checking the query string text.
+    // Skip internal and system schemas
     if schema == "flashback" || schema == "flashback_recycle" || schema.starts_with("pg_temp") {
         return false;
     }
@@ -103,8 +101,7 @@ pub fn handle_drop_table(query: &str) -> bool {
         return false;
     }
 
-    // Gerçek tablo tipini pg_class'tan kontrol et
-    // relpersistence = 't' ise temp table, atla
+    // Skip temp tables: relpersistence = 't' means temporary
     let is_temp = Spi::get_one::<String>(&format!(
         "SELECT relpersistence::text FROM pg_class WHERE relname = '{}' LIMIT 1",
         bare_table

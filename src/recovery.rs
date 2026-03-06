@@ -67,10 +67,8 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
         }
     }
 
-    // if target_schema is provided, use it; otherwise, restore to original schema
     let restore_schema = target_schema.unwrap_or(&schema_name);
 
-     // Return error if target table already exists
     if let Ok(Some(true)) = Spi::get_one::<bool>(&format!(
         "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname = '{}' AND tablename = '{}')",
         restore_schema, table_name
@@ -82,14 +80,11 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
     let sql = format!("ALTER TABLE flashback_recycle.{} SET SCHEMA {}", recycled_name, restore_schema);
     match Spi::run(&sql) {
     Ok(_) => {
-        // First rename
         let rename_sql = format!("ALTER TABLE {}.{} RENAME TO {}", restore_schema, recycled_name, table_name);
         if let Err(e) = Spi::run(&rename_sql) {
             pgrx::warning!("Rename error: {}", e);
             return false;
         }
-        
-        // Then update metadata
         let update_sql = format!(
             "UPDATE flashback.operations SET restored = true WHERE table_name = '{}' AND recycled_name = '{}' AND restored = false",
             table_name, recycled_name
@@ -154,10 +149,8 @@ fn flashback_restore_by_id(op_id: i64, target_schema: Option<&str>) -> bool {
         }
     }
 
-    // if target_schema is provided, use it; otherwise, restore to original schema
     let restore_schema = target_schema.unwrap_or(&schema_name);
 
-     // Return error if target table already exists
     if let Ok(Some(true)) = Spi::get_one::<bool>(&format!(
         "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname = '{}' AND tablename = '{}')",
         restore_schema, table_name
@@ -169,14 +162,11 @@ fn flashback_restore_by_id(op_id: i64, target_schema: Option<&str>) -> bool {
     let sql = format!("ALTER TABLE flashback_recycle.{} SET SCHEMA {}", recycled_name, restore_schema);
     match Spi::run(&sql) {
     Ok(_) => {
-        // First rename
         let rename_sql = format!("ALTER TABLE {}.{} RENAME TO {}", restore_schema, recycled_name, table_name);
         if let Err(e) = Spi::run(&rename_sql) {
             pgrx::warning!("Rename error: {}", e);
             return false;
         }
-        
-        // Then update metadata
         let update_sql = format!(
             "UPDATE flashback.operations SET restored = true WHERE table_name = '{}' AND recycled_name = '{}' AND restored = false",
             table_name, recycled_name
@@ -248,14 +238,12 @@ fn flashback_purge(table_name: &str) -> bool {
         }
     }
 
-    // Drop the physical table from the recycle bin schema
     let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{} CASCADE", recycled_name);
     if let Err(e) = Spi::run(&drop_sql) {
         pgrx::warning!("Failed to drop recycled table '{}': {}", recycled_name, e);
         return false;
     }
 
-    // Remove the metadata record
     let delete_sql = format!(
         "DELETE FROM flashback.operations WHERE recycled_name = '{}' AND restored = false",
         recycled_name

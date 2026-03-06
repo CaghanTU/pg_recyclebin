@@ -8,7 +8,6 @@ static MAX_SIZE: GucSetting<i32> = GucSetting::<i32>::new(102400);
 static WORKER_INTERVAL_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(60);
 static EXCLUDED_SCHEMAS: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
-/// Called in _PG_init. Registers GUCs with PostgreSQL.
 pub fn register_gucs() {
     GucRegistry::define_int_guc(
         c"flashback.retention_days",
@@ -63,7 +62,6 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 }
-
 
 pub fn get_retention_days() -> i32 {
     RETENTION_DAYS.get()

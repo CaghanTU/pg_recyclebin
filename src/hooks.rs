@@ -16,7 +16,6 @@ pub fn uninstall() {
     }
 }
 
-// Helper function to convert C string pointer to Rust String
 fn cstr_to_string(ptr: *const std::os::raw::c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
@@ -42,7 +41,7 @@ unsafe extern "C-unwind" fn process_utility_hook(
     qc: *mut pg_sys::QueryCompletion,
 ) {
 
-   // Check AST node: only process actual DROP TABLE commands
+   // Only intercept DROP TABLE commands (checked via AST node type)
     let is_drop_table = unsafe {
         if pstmt.is_null() {
             false
@@ -73,7 +72,6 @@ unsafe extern "C-unwind" fn process_utility_hook(
             }
         }
     }
-    // Chain to previous hook or standard function
     if let Some(prev) = PREV_PROCESS_UTILITY {
         prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
     } else {

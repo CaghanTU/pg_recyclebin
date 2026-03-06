@@ -24,13 +24,10 @@ pub extern "C-unwind" fn flashback_cleanup_worker_main(_arg: pg_sys::Datum) {
     pgrx::log!("Flashback Auto-Cleanup Worker started");
     
     while BackgroundWorker::wait_latch(Some(Duration::from_secs(crate::guc::worker_interval_seconds() as u64))) {
-        // Check if we received SIGHUP (config reload)
         if BackgroundWorker::sighup_received() {
-            // Reload configuration
-            pgrx::log!("Flashback Worker: Reloading configuration");
+            pgrx::log!("Flashback worker: configuration reloaded");
         }
 
-        // Run cleanup in a transaction
         BackgroundWorker::transaction(|| {
             cleanup_expired_tables();
         });
@@ -48,16 +45,13 @@ fn cleanup_expired_tables() {
     }
 
     let result: Result<(), spi::Error> = Spi::connect(|client| {
-        // Find expired tables
-        let query = format!(
-            "SELECT op_id, recycled_name, table_name 
-             FROM flashback.operations 
-             WHERE restored = false 
-             AND retention_until < NOW() 
-             ORDER BY timestamp"
-        );
+        let query = "SELECT op_id, recycled_name, table_name \
+             FROM flashback.operations \
+             WHERE restored = false \
+             AND retention_until < NOW() \
+             ORDER BY timestamp";
 
-        let results = client.select(&query, None, &[] as &[pgrx::datum::DatumWithOid])?;
+        let results = client.select(query, None, &[] as &[pgrx::datum::DatumWithOid])?;
         
         let mut cleaned_count = 0;
         
@@ -70,31 +64,20 @@ fn cleanup_expired_tables() {
                 continue;
             }
 
-            // Drop the expired table
-            let drop_sql = format!(
-                "DROP TABLE IF EXISTS flashback_recycle.{} CASCADE",
-                recycled_name
-            );
+            let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{} CASCADE", recycled_name);
             
             if let Err(e) = Spi::run(&drop_sql) {
-                pgrx::warning!(
-                    "Failed to drop expired table '{}': {}", 
-                    recycled_name, e
-                );
+                pgrx::warning!("Failed to drop expired table '{}': {}", recycled_name, e);
                 continue;
             }
 
-            // Delete metadata record
             let delete_sql = format!(
                 "DELETE FROM flashback.operations WHERE op_id = {}",
                 op_id
             );
             
             if let Err(e) = Spi::run(&delete_sql) {
-                pgrx::warning!(
-                    "Failed to delete metadata for op_id {}: {}", 
-                    op_id, e
-                );
+                pgrx::warning!("Failed to delete metadata for op_id {}: {}", op_id, e);
                 continue;
             }
 
