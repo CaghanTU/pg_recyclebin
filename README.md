@@ -128,6 +128,18 @@ Returns `true` on success. Regular users can only purge tables they dropped.
 
 ---
 
+### `flashback_purge_all()`
+
+Permanently removes all entries from the recycle bin.
+
+```sql
+SELECT flashback_purge_all();
+```
+
+Returns the number of tables that were purged. Superusers purge everything; regular users purge only their own tables.
+
+---
+
 ### `flashback_status()`
 
 Shows the current state of the recycle bin alongside the configured limits.
@@ -195,6 +207,27 @@ SELECT pg_reload_conf();
 | Regular user tries to restore another user's table | Returns `false` with a `WARNING` |
 
 All public functions are `SECURITY DEFINER` so that regular users can access the `flashback` schema without being granted direct schema privileges.
+
+---
+
+## TRUNCATE Support
+
+pg_flashback also intercepts `TRUNCATE TABLE`. Before the truncation runs, the current data is copied into a backup table in the `flashback_recycle` schema. The actual `TRUNCATE` then executes normally, leaving the table empty.
+
+```sql
+TRUNCATE TABLE orders;
+
+SELECT * FROM flashback_list_recycled_tables();  -- backup entry visible
+
+SELECT flashback_restore('orders', NULL);        -- data restored
+SELECT * FROM orders;                            -- rows are back
+```
+
+| | DROP TABLE | TRUNCATE TABLE |
+|---|---|---|
+| Table after operation | Gone | Empty, still exists |
+| What pg_flashback saves | The whole table | A copy of the data |
+| How restore works | Moves table back | `INSERT INTO ... SELECT * FROM backup` |
 
 ---
 
