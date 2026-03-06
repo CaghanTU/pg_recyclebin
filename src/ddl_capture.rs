@@ -65,6 +65,10 @@ pub fn handle_drop_table(query: &str) -> bool {
         .trim_end_matches(';')
         .trim()
         .split_whitespace()
+        .filter(|w| {
+            let u = w.to_uppercase();
+            u != "CASCADE" && u != "RESTRICT"
+        })
         .last()
         .unwrap_or("");
 
