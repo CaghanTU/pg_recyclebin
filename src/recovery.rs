@@ -18,16 +18,29 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
     }
 
     let (recycled_name, schema_name, role_name, operation_type) = {
+        // Get op_id first, then acquire an advisory lock on it to prevent concurrent restores
+        let op_id_val = Spi::get_one::<i64>(&format!(
+            "SELECT op_id FROM flashback.operations \
+             WHERE table_name = '{}' AND restored = false \
+             ORDER BY timestamp DESC LIMIT 1",
+            table_name
+        )).unwrap_or(None);
+        let op_id_val = match op_id_val {
+            Some(id) => id,
+            None => {
+                pgrx::warning!("Table not found in recycle bin: {}", table_name);
+                return false;
+            }
+        };
+        let _ = Spi::run(&format!("SELECT pg_advisory_xact_lock({})", op_id_val));
         let mut found = None;
         let _ = Spi::connect(|client| {
             let rows = client.select(
                 &format!(
                     "SELECT recycled_name, schema_name, role_name, operation_type \
                      FROM flashback.operations \
-                     WHERE table_name = '{}' AND restored = false \
-                     ORDER BY timestamp DESC LIMIT 1 \
-                     FOR UPDATE",
-                    table_name
+                     WHERE op_id = {} AND restored = false",
+                    op_id_val
                 ),
                 None,
                 &[],
@@ -79,6 +92,42 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
     );
     match Spi::run(&sql) {
         Ok(_) => {
+            // Restore sequences to max values present in the restored data
+            let serial_cols: Vec<(String, String)> = {
+                let mut cols = Vec::new();
+                let _ = Spi::connect(|client| {
+                    let rows = client.select(
+                        &format!(
+                            "SELECT column_name, \
+                             pg_get_serial_sequence('{}.{}', column_name) \
+                             FROM information_schema.columns \
+                             WHERE table_schema = '{}' AND table_name = '{}' \
+                             AND column_default LIKE 'nextval%%' \
+                             AND pg_get_serial_sequence('{}.{}', column_name) IS NOT NULL",
+                            restore_schema, table_name, restore_schema, table_name,
+                            restore_schema, table_name
+                        ),
+                        None, &[],
+                    )?;
+                    for row in rows {
+                        let col = row.get::<String>(1)?.unwrap_or_default();
+                        let seq = row.get::<String>(2)?.unwrap_or_default();
+                        if !col.is_empty() && !seq.is_empty() {
+                            cols.push((col, seq));
+                        }
+                    }
+                    Ok::<_, spi::Error>(())
+                });
+                cols
+            };
+            for (col, seq) in &serial_cols {
+                if let Ok(Some(max_val)) = Spi::get_one::<i64>(
+                    &format!("SELECT COALESCE(MAX(\"{}\"), 0)::bigint FROM \"{}\".\"{}\"" ,
+                             col, restore_schema, table_name)
+                ) {
+                    let _ = Spi::run(&format!("SELECT setval('{}', {})", seq, max_val.max(1)));
+                }
+            }
             let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{}", recycled_name);
             let _ = Spi::run(&drop_sql);
             let update_sql = format!(
@@ -131,14 +180,15 @@ fn flashback_restore(table_name: &str, target_schema: Option<&str>) -> bool {
 #[pg_extern]
 fn flashback_restore_by_id(op_id: i64, target_schema: Option<&str>) -> bool {
     let (recycled_name, table_name, schema_name, role_name, operation_type) = {
+        // Acquire advisory lock on this op_id to prevent concurrent restores
+        let _ = Spi::run(&format!("SELECT pg_advisory_xact_lock({})", op_id));
         let mut found = None;
         let _ = Spi::connect(|client| {
             let rows = client.select(
                 &format!(
                     "SELECT recycled_name, table_name, schema_name, role_name, operation_type \
                      FROM flashback.operations \
-                     WHERE op_id = {} AND restored = false \
-                     FOR UPDATE",
+                     WHERE op_id = {} AND restored = false",
                     op_id
                 ),
                 None,
@@ -189,6 +239,42 @@ fn flashback_restore_by_id(op_id: i64, target_schema: Option<&str>) -> bool {
     );
     match Spi::run(&sql) {
         Ok(_) => {
+            // Restore sequences to max values present in the restored data
+            let serial_cols: Vec<(String, String)> = {
+                let mut cols = Vec::new();
+                let _ = Spi::connect(|client| {
+                    let rows = client.select(
+                        &format!(
+                            "SELECT column_name, \
+                             pg_get_serial_sequence('{}.{}', column_name) \
+                             FROM information_schema.columns \
+                             WHERE table_schema = '{}' AND table_name = '{}' \
+                             AND column_default LIKE 'nextval%%' \
+                             AND pg_get_serial_sequence('{}.{}', column_name) IS NOT NULL",
+                            restore_schema, table_name, restore_schema, table_name,
+                            restore_schema, table_name
+                        ),
+                        None, &[],
+                    )?;
+                    for row in rows {
+                        let col = row.get::<String>(1)?.unwrap_or_default();
+                        let seq = row.get::<String>(2)?.unwrap_or_default();
+                        if !col.is_empty() && !seq.is_empty() {
+                            cols.push((col, seq));
+                        }
+                    }
+                    Ok::<_, spi::Error>(())
+                });
+                cols
+            };
+            for (col, seq) in &serial_cols {
+                if let Ok(Some(max_val)) = Spi::get_one::<i64>(
+                    &format!("SELECT COALESCE(MAX(\"{}\"), 0)::bigint FROM \"{}\".\"{}\"" ,
+                             col, restore_schema, table_name)
+                ) {
+                    let _ = Spi::run(&format!("SELECT setval('{}', {})", seq, max_val.max(1)));
+                }
+            }
             let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{}", recycled_name);
             let _ = Spi::run(&drop_sql);
             let update_sql = format!(

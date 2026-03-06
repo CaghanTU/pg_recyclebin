@@ -986,6 +986,7 @@ dependencies = [
  "chrono",
  "pgrx",
  "pgrx-tests",
+ "serde_json",
 ]
 
 [[package]]

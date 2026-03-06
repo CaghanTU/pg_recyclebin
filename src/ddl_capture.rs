@@ -56,6 +56,10 @@ fn enforce_size_limit() {
 }
 
 pub fn handle_drop_table(query: &str) -> bool {
+    // Skip silently if the extension is not yet installed
+    if Spi::get_one::<bool>("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'flashback')").unwrap_or(None) != Some(true) {
+        return false;
+    }
     enforce_table_limit();
     enforce_size_limit();
 
@@ -159,6 +163,10 @@ pub fn handle_drop_table(query: &str) -> bool {
 }
 
 pub fn handle_truncate_table(query: &str) -> bool {
+    // Skip silently if the extension is not yet installed
+    if Spi::get_one::<bool>("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'flashback')").unwrap_or(None) != Some(true) {
+        return false;
+    }
     // Extract table name: "TRUNCATE [TABLE] orders [CASCADE|RESTRICT|...]"
     let table_name = query
         .trim()
@@ -226,6 +234,41 @@ pub fn handle_truncate_table(query: &str) -> bool {
 
     let recycled_name = format!("{}_{}", bare_table, op_id);
 
+    // Collect sequence info for all serial columns
+    let seq_info = {
+        let mut map = serde_json::Map::new();
+        let _ = Spi::connect(|client| {
+            let rows = client.select(
+                &format!(
+                    "SELECT column_name, pg_get_serial_sequence('{}.{}', column_name) \
+                    FROM information_schema.columns \
+                    WHERE table_schema = '{}' AND table_name = '{}' \
+                    AND column_default LIKE 'nextval%%'",
+                    schema, bare_table, schema, bare_table
+                ),
+                None,
+                &[],
+            )?;
+            for row in rows {
+                let col = row.get::<String>(1)?.unwrap_or_default();
+                let seq = row.get::<String>(2)?.unwrap_or_default();
+                if !seq.is_empty() {
+                    if let Ok(Some(last_val)) = Spi::get_one::<i64>(
+                        &format!("SELECT last_value FROM {}", seq)
+                    ) {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("seq".into(), serde_json::Value::String(seq));
+                        obj.insert("last_value".into(), serde_json::Value::Number(last_val.into()));
+                        map.insert(col, serde_json::Value::Object(obj));
+                    }
+                }
+            }
+            Ok::<_, spi::Error>(())
+        });
+        serde_json::Value::Object(map)
+    };
+    let metadata_json = seq_info.to_string();
+
     // Copy data into a new backup table in flashback_recycle schema
     let create_sql = format!(
         "CREATE TABLE flashback_recycle.{} AS SELECT * FROM {}.{}",
@@ -239,8 +282,8 @@ pub fn handle_truncate_table(query: &str) -> bool {
     }
 
     if let Err(e) = Spi::run(&format!(
-        "UPDATE flashback.operations SET recycled_name = '{}' WHERE op_id = {}",
-        recycled_name, op_id
+        "UPDATE flashback.operations SET recycled_name = '{}', metadata = '{}' WHERE op_id = {}",
+        recycled_name, metadata_json, op_id
     )) {
         pgrx::warning!("TRUNCATE metadata update error: {}", e);
         return false;
