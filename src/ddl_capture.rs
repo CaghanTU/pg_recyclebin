@@ -83,6 +83,12 @@ pub fn handle_drop_table(query: &str) -> bool {
         return false;
     }
 
+    // Skip if schema is in excluded list
+    let excluded = crate::guc::get_excluded_schemas();
+    if excluded.iter().any(|s| s == &schema) {
+        return false;
+    }
+
     // SQL injection protection
     if bare_table.contains('\'') || bare_table.contains(';') {
         pgrx::warning!("Invalid table name: {}", bare_table);
@@ -92,7 +98,7 @@ pub fn handle_drop_table(query: &str) -> bool {
         pgrx::warning!("Invalid schema name: {}", schema);
         return false;
     }
-    
+
     // Gerçek tablo tipini pg_class'tan kontrol et
     // relpersistence = 't' ise temp table, atla
     let is_temp = Spi::get_one::<String>(&format!(

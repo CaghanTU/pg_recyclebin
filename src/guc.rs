@@ -1,10 +1,12 @@
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
+use std::ffi::{CStr, CString};
 
 
 static RETENTION_DAYS: GucSetting<i32> = GucSetting::<i32>::new(7);
 static MAX_TABLES: GucSetting<i32> = GucSetting::<i32>::new(100);
 static MAX_SIZE: GucSetting<i32> = GucSetting::<i32>::new(102400);
 static WORKER_INTERVAL_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(60);
+static EXCLUDED_SCHEMAS: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 /// Called in _PG_init. Registers GUCs with PostgreSQL.
 pub fn register_gucs() {
@@ -51,6 +53,15 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_string_guc(
+        c"flashback.excluded_schemas",
+        c"Comma-separated list of schemas to exclude from the recycle bin",
+        c"Tables in these schemas will not be captured when dropped.",
+        &EXCLUDED_SCHEMAS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 
@@ -68,4 +79,16 @@ pub fn get_max_size() -> i32 {
 
 pub fn worker_interval_seconds() -> i32 {
     WORKER_INTERVAL_SECONDS.get()
+}
+
+pub fn get_excluded_schemas() -> Vec<String> {
+    EXCLUDED_SCHEMAS
+        .get()
+        .as_ref()
+        .and_then(|s| s.to_str().ok())
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
