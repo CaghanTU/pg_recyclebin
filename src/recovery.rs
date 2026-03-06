@@ -462,8 +462,8 @@ fn flashback_purge_by_id(op_id: i64) -> bool {
     true
 }
 
-#[pg_extern]
-fn flashback_restore_table(table_name: &str) -> bool {
+#[pg_extern(name = "flashback_restore")]
+fn flashback_restore_no_schema(table_name: &str) -> bool {
     flashback_restore(table_name, None)
 }
 
