@@ -332,4 +332,163 @@ mod tests {
         Spi::run("DROP TABLE IF EXISTS test_list_trunc CASCADE").unwrap();
         Spi::run("DELETE FROM flashback.operations WHERE table_name IN ('test_list_drop','test_list_trunc')").unwrap();
     }
+
+    // Test 15: GENERATED ALWAYS AS IDENTITY column — DROP restore preserves sequence
+    #[pg_test]
+    fn test_identity_column_drop_restore() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_identity_drop CASCADE").unwrap();
+        Spi::run(
+            "CREATE TABLE test_identity_drop (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, val text)"
+        ).unwrap();
+        Spi::run("INSERT INTO test_identity_drop (val) VALUES ('a'), ('b'), ('c')").unwrap();
+
+        Spi::run("DROP TABLE test_identity_drop").unwrap();
+
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_identity_drop', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "IDENTITY table DROP should be restorable");
+
+        let count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_identity_drop"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(count, 3, "All 3 rows should be restored");
+
+        // Sequence must continue from 4 (not restart from 1)
+        Spi::run("INSERT INTO test_identity_drop (val) VALUES ('d')").unwrap();
+        let max_id = Spi::get_one::<i64>(
+            "SELECT MAX(id) FROM test_identity_drop"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(max_id, 4, "IDENTITY sequence should continue from 4 after DROP restore");
+
+        Spi::run("DROP TABLE IF EXISTS test_identity_drop CASCADE").unwrap();
+        Spi::run("DELETE FROM flashback.operations WHERE table_name = 'test_identity_drop'").unwrap();
+    }
+
+    // Test 16: GENERATED ALWAYS AS IDENTITY column — TRUNCATE restore works correctly
+    // This test also covers the OVERRIDING SYSTEM VALUE fix required for IDENTITY columns.
+    #[pg_test]
+    fn test_identity_column_truncate_restore() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_identity_trunc CASCADE").unwrap();
+        Spi::run(
+            "CREATE TABLE test_identity_trunc (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, val text)"
+        ).unwrap();
+        Spi::run("INSERT INTO test_identity_trunc (val) VALUES ('x'), ('y'), ('z')").unwrap();
+
+        Spi::run("TRUNCATE TABLE test_identity_trunc").unwrap();
+
+        let op_type = Spi::get_one::<String>(
+            "SELECT operation_type FROM flashback.operations \
+             WHERE table_name = 'test_identity_trunc' AND restored = false LIMIT 1"
+        ).unwrap().unwrap_or_default();
+        assert_eq!(op_type, "TRUNCATE");
+
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_identity_trunc', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "IDENTITY table TRUNCATE restore should succeed (OVERRIDING SYSTEM VALUE)");
+
+        let count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_identity_trunc"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(count, 3, "All 3 rows should be restored");
+
+        // Sequence must continue from 4
+        Spi::run("INSERT INTO test_identity_trunc (val) VALUES ('w')").unwrap();
+        let max_id = Spi::get_one::<i64>(
+            "SELECT MAX(id) FROM test_identity_trunc"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(max_id, 4, "IDENTITY sequence should continue from 4 after TRUNCATE restore");
+
+        Spi::run("DROP TABLE IF EXISTS test_identity_trunc CASCADE").unwrap();
+        Spi::run("DELETE FROM flashback.operations WHERE table_name = 'test_identity_trunc'").unwrap();
+    }
+
+    // Test 17: Table in a non-public schema is captured and restored correctly
+    #[pg_test]
+    fn test_non_public_schema_restore() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE SCHEMA IF NOT EXISTS testns").unwrap();
+        Spi::run("DROP TABLE IF EXISTS testns.ns_orders CASCADE").unwrap();
+        Spi::run("CREATE TABLE testns.ns_orders (id int, val text)").unwrap();
+        Spi::run("INSERT INTO testns.ns_orders VALUES (1, 'one'), (2, 'two')").unwrap();
+
+        Spi::run("DROP TABLE testns.ns_orders").unwrap();
+
+        let schema_in_bin = Spi::get_one::<String>(
+            "SELECT schema_name FROM flashback.operations \
+             WHERE table_name = 'ns_orders' AND restored = false LIMIT 1"
+        ).unwrap().unwrap_or_default();
+        assert_eq!(schema_in_bin, "testns", "schema_name in bin should be 'testns'");
+
+        // NULL target_schema → restores to original schema (testns)
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('ns_orders', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "Non-public schema table should be restorable");
+
+        let count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM testns.ns_orders"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(count, 2, "Both rows should be restored in testns schema");
+
+        Spi::run("DROP TABLE IF EXISTS testns.ns_orders CASCADE").unwrap();
+        Spi::run("DELETE FROM flashback.operations WHERE table_name = 'ns_orders'").unwrap();
+        Spi::run("DROP SCHEMA IF EXISTS testns CASCADE").unwrap();
+    }
+
+    // Test 18: TRUNCATE on an empty table — restore must not crash and return 0 rows
+    #[pg_test]
+    fn test_empty_table_truncate_restore() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_empty_trunc CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_empty_trunc (id int, val text)").unwrap();
+        // No rows — table is intentionally empty
+
+        Spi::run("TRUNCATE TABLE test_empty_trunc").unwrap();
+
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_empty_trunc', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "Empty table TRUNCATE restore should succeed without crash");
+
+        let count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_empty_trunc"
+        ).unwrap().unwrap_or(99);
+        assert_eq!(count, 0, "Restored empty table should have 0 rows");
+
+        Spi::run("DROP TABLE IF EXISTS test_empty_trunc CASCADE").unwrap();
+        Spi::run("DELETE FROM flashback.operations WHERE table_name = 'test_empty_trunc'").unwrap();
+    }
+
+    // Test 19: flashback.max_tables GUC — oldest entry is evicted when limit is reached
+    #[pg_test]
+    fn test_table_limit_enforcement() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        // Clean slate so residual entries from other tests don't skew the count
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+
+        Spi::run("SET flashback.max_tables = 3").unwrap();
+
+        for i in 1..=5 {
+            Spi::run(&format!("DROP TABLE IF EXISTS test_limit_{i} CASCADE")).unwrap();
+            Spi::run(&format!("CREATE TABLE test_limit_{i} (id int)")).unwrap();
+            Spi::run(&format!("DROP TABLE test_limit_{i}")).unwrap();
+        }
+
+        let bin_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations \
+             WHERE table_name LIKE 'test_limit_%' AND restored = false"
+        ).unwrap().unwrap_or(99);
+        assert!(
+            bin_count <= 3,
+            "Recycle bin should have ≤3 entries with max_tables=3, got {}",
+            bin_count
+        );
+
+        Spi::run("RESET flashback.max_tables").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+    }
 }

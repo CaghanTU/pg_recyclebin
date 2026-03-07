@@ -25,6 +25,14 @@ CREATE TABLE IF NOT EXISTS flashback.operations (
 );
 CREATE INDEX IF NOT EXISTS idx_flashback_ops_table ON flashback.operations (table_name, timestamp);
 CREATE INDEX IF NOT EXISTS idx_flashback_ops_retention ON flashback.operations (retention_until);
+-- Explicit permission hardening: block PUBLIC access to internal schemas/tables.
+-- PostgreSQL defaults don't grant PUBLIC access to non-public schemas, but we
+-- make this explicit so the intent is clear and survives pg_dump/restore cycles.
+REVOKE ALL ON SCHEMA flashback FROM PUBLIC;
+REVOKE ALL ON SCHEMA flashback_recycle FROM PUBLIC;
+REVOKE ALL ON ALL TABLES IN SCHEMA flashback FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA flashback REVOKE ALL ON TABLES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA flashback_recycle REVOKE ALL ON TABLES FROM PUBLIC;
 "#,
     name = "flashback_schema_setup",
     bootstrap
