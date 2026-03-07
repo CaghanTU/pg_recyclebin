@@ -151,6 +151,39 @@ pub fn handle_drop_table(query: &str) -> bool {
         return false;
     }
 
+    // Rename owned sequences with op_id suffix to prevent name collisions when the
+    // same table is dropped again before being restored (e.g. orders_id_seq -> orders_id_seq_42).
+    let mut seq_names: Vec<String> = Vec::new();
+    let _ = Spi::connect(|client| {
+        let rows = client.select(
+            &format!(
+                "SELECT s.relname \
+                 FROM pg_depend d \
+                 JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
+                 JOIN pg_class t ON t.oid = d.refobjid AND t.relname = '{}' \
+                 WHERE d.deptype IN ('a', 'i') \
+                   AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'flashback_recycle')",
+                recycled_name
+            ),
+            None, &[],
+        )?;
+        for row in rows {
+            if let Ok(Some(n)) = row.get::<String>(1) {
+                seq_names.push(n);
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(())
+    });
+    for seq_name in &seq_names {
+        let new_seq_name = format!("{}_{}", seq_name, op_id);
+        if let Err(e) = Spi::run(&format!(
+            "ALTER SEQUENCE flashback_recycle.{} RENAME TO {}",
+            seq_name, new_seq_name
+        )) {
+            pgrx::warning!("Failed to rename sequence '{}': {}", seq_name, e);
+        }
+    }
+
     if let Err(e) = Spi::run(&format!(
         "UPDATE flashback.operations SET recycled_name = '{}' WHERE op_id = {}",
         recycled_name, op_id

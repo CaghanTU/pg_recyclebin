@@ -26,6 +26,7 @@ A PostgreSQL extension that adds a **recycle bin** for dropped tables. Instead o
 - PostgreSQL 17
 - pgrx 0.16.1
 - Rust (stable)
+- Rocky 9
 
 ---
 
@@ -273,9 +274,4 @@ pg_flashback creates two schemas on install:
 - **No dependency tracking**: if `DROP TABLE ... CASCADE` drops dependent views or foreign keys, those are not captured and cannot be restored.
 - `flashback_purge` removes only the most recently dropped version; use `flashback_purge_by_id` to remove a specific version.
 - `DROP SCHEMA ... CASCADE` is not intercepted; individual table drops within a schema cascade are not captured.
-
----
-
-## License
-
-MIT
+- **TRUNCATE on large tables**: the backup is a full data copy (`CREATE TABLE ... AS SELECT *`). On very large tables (hundreds of millions of rows) this will consume additional disk space equal to the original table size and may take noticeable time before the TRUNCATE completes. For tables in that size range, consider whether TRUNCATE recovery is needed before enabling pg_flashback, or exclude the schema via `flashback.excluded_schemas`.
