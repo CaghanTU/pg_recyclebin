@@ -401,43 +401,22 @@ fn tokenise_table_list(list_str: &str) -> Vec<String> {
     tokens
 }
 
-pub fn handle_drop_table(query: &str) -> bool {
+/// Called from the ProcessUtility hook with names extracted from the DropStmt AST.
+/// Using the AST avoids mis-parsing the query string when fired inside a multi-statement batch.
+pub fn handle_drop_table(tables: &[(String, String)], if_exists: bool, cascade: bool) -> bool {
     // Skip silently if the extension is not yet installed
     if Spi::get_one::<bool>("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'flashback')").unwrap_or(None) != Some(true) {
         return false;
     }
 
-    // Strip: DROP TABLE [IF EXISTS]  ... [CASCADE|RESTRICT]
-    // Everything that remains after removing keywords is the comma-separated table list.
-    let stripped: String = query
-        .trim()
-        .trim_end_matches(';')
-        .split_whitespace()
-        .filter(|w| {
-            let u = w.to_uppercase();
-            u != "DROP" && u != "TABLE" && u != "IF" && u != "EXISTS"
-                && u != "CASCADE" && u != "RESTRICT"
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let tokens = tokenise_table_list(&stripped);
-    if tokens.is_empty() {
+    if tables.is_empty() {
         return false;
     }
 
-    // Determine if the query had IF EXISTS / CASCADE keywords (for fallback drops).
-    let upper = query.to_uppercase();
-    let if_exists = upper.contains("IF EXISTS");
-    let cascade   = upper.contains("CASCADE");
-
     let mut any_seen = false;
-    // skipped: tables that exist but were not moved to flashback_recycle (temp, excluded, etc.)
-    // These need their own DROP executed.
     let mut skipped_drops: Vec<String> = Vec::new();
 
-    for token in &tokens {
-        let (schema, bare_table) = split_schema_table(token);
+    for (schema, bare_table) in tables {
 
         // Quick existence + kind check so we know whether to pass to PG or absorb.
         let row_info = Spi::get_one::<String>(&format!(
@@ -470,7 +449,14 @@ pub fn handle_drop_table(query: &str) -> bool {
             let casc  = if cascade   { " CASCADE"  } else { "" };
             // The /* pg_flashback_internal */ comment causes hooks.rs to skip this statement,
             // preventing a re-entrant infinite loop.
-            skipped_drops.push(format!("DROP TABLE {}{}.{}{} /* pg_flashback_internal */", if_e, schema, bare_table, casc));
+            // Quote identifiers so names with special chars are handled correctly.
+            skipped_drops.push(format!(
+                "DROP TABLE {}\"{}\".\"{}\"{} /* pg_flashback_internal */",
+                if_e,
+                schema.replace('"', "\"\""),
+                bare_table.replace('"', "\"\""),
+                casc
+            ));
         } else {
             // Capturable — move it to flashback_recycle.
             capture_drop_inner(&schema, &bare_table);
@@ -572,37 +558,15 @@ fn capture_single_truncate(schema: &str, bare_table: &str) {
     pgrx::log!("TRUNCATE captured: {}.{} -> {}", schema, bare_table, recycled_name);
 }
 
-pub fn handle_truncate_table(query: &str) -> bool {
+/// Called from the ProcessUtility hook with names extracted from the TruncateStmt AST.
+pub fn handle_truncate_table(tables: &[(String, String)]) -> bool {
     // Skip silently if the extension is not yet installed
     if Spi::get_one::<bool>("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'flashback')").unwrap_or(None) != Some(true) {
         return false;
     }
 
-    // Parse ALL table refs: "TRUNCATE [TABLE] [ONLY] t1, t2, t3 [CASCADE|RESTRICT]"
-    // Tokens that are not keywords form the table list; split by comma.
-    let token_str: String = query
-        .trim()
-        .trim_end_matches(';')
-        .split_whitespace()
-        .filter(|w| {
-            let u = w.to_uppercase();
-            u != "TRUNCATE" && u != "TABLE" && u != "CASCADE"
-                && u != "RESTRICT" && u != "ONLY"
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let table_refs: Vec<&str> = token_str.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-
-    for table_ref in &table_refs {
-        let (schema, bare_table) = if table_ref.contains('.') {
-            let (s, t) = table_ref.split_once('.').unwrap();
-            (s.trim().to_string(), t.trim().to_string())
-        } else {
-            ("public".to_string(), table_ref.trim().to_string())
-        };
-
-        if check_capturable(&schema, &bare_table).is_none() {
+    for (schema, bare_table) in tables {
+        if check_capturable(schema, bare_table).is_none() {
             continue;
         }
 
@@ -630,14 +594,14 @@ pub fn handle_truncate_table(query: &str) -> bool {
         if relpersistence == "t" { continue; }
         if relkind == "p" {
             pgrx::warning!(
-                "pg_flashback: '{}.{}' is a partitioned table — TRUNCATE capture skipped (not supported in v0.1).",
+                "pg_flashback: '{}.{}' is a partitioned table — TRUNCATE capture skipped.",
                 schema, bare_table
             );
             continue;
         }
         if is_partition { continue; }
 
-        capture_single_truncate(&schema, &bare_table);
+        capture_single_truncate(schema, bare_table);
     }
 
     false  // false = let PostgreSQL execute the actual TRUNCATE
