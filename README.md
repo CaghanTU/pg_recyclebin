@@ -8,10 +8,18 @@ A PostgreSQL extension that adds a **recycle bin** for dropped tables. Instead o
 
 ## Features
 
-- Automatically captures `DROP TABLE` (including `DROP TABLE ... CASCADE`) and `TRUNCATE TABLE`
+- Automatically captures `DROP TABLE` (including multi-table `DROP TABLE t1, t2`), `DROP TABLE ... CASCADE`, and `TRUNCATE TABLE`
+- Captures `DROP SCHEMA ... CASCADE` — all tables in the schema are saved before deletion
 - Stores dropped/truncated tables in a `flashback_recycle` schema until restored or expired
 - Restore by table name or by specific operation ID (useful when a table was dropped multiple times)
-- Sequence state automatically restored after TRUNCATE recovery
+- **Full metadata capture and restore:**
+  - Dependent views are dropped and recreated on restore
+  - Incoming FK constraints (from other tables pointing at the dropped table) are captured and re-applied
+  - RLS policies are captured and re-applied, with `ENABLE ROW LEVEL SECURITY` if needed
+  - Triggers survive restore automatically (they travel with the physical table)
+  - Partitioned tables: children are co-moved and re-attached; missing partitions are recreated as empty shells with a warning
+- Quoted identifiers fully supported: `DROP TABLE "My Schema"."My Table"` works correctly
+- Sequence / IDENTITY column state automatically restored after DROP and TRUNCATE recovery
 - FIFO eviction when table count or total size limits are reached
 - Background worker that automatically purges expired entries
 - Permission model: superusers see and manage all tables; regular users can only see and restore their own
@@ -269,9 +277,9 @@ pg_flashback creates two schemas on install:
 
 ---
 
-## Limitations / Roadmap
+## Limitations
 
-- **No dependency tracking**: if `DROP TABLE ... CASCADE` drops dependent views or foreign keys, those are not captured and cannot be restored.
 - `flashback_purge` removes only the most recently dropped version; use `flashback_purge_by_id` to remove a specific version.
-- `DROP SCHEMA ... CASCADE` is not intercepted; individual table drops within a schema cascade are not captured.
-- **TRUNCATE on large tables**: the backup is a full data copy (`CREATE TABLE ... AS SELECT *`). On very large tables (hundreds of millions of rows) this will consume additional disk space equal to the original table size and may take noticeable time before the TRUNCATE completes. For tables in that size range, consider whether TRUNCATE recovery is needed before enabling pg_flashback, or exclude the schema via `flashback.excluded_schemas`.
+- **TRUNCATE on large tables**: the backup is a full data copy (`CREATE TABLE ... AS SELECT *`). On very large tables this will consume additional disk space equal to the original table size and may take noticeable time. For tables in that size range consider excluding the schema via `flashback.excluded_schemas`.
+- When a partitioned table's child partitions are missing after restore (edge case: child was in a different schema that was also dropped), pg_flashback recreates the partition shell but the original data is gone — a `WARNING` is emitted.
+- Materialized views are not captured (only regular views).

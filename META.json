@@ -1,0 +1,52 @@
+{
+   "name": "pg_flashback",
+   "abstract": "Recycle bin for PostgreSQL tables — intercepts DROP TABLE and TRUNCATE, lets you restore accidentally dropped data.",
+   "description": "pg_flashback is a PostgreSQL extension that acts as a recycle bin for table operations. When a DROP TABLE or TRUNCATE TABLE is executed, the extension captures the table (and its metadata including views, FK constraints, RLS policies, and partition structure) and stores it safely. You can restore by table name or by operation ID. Features include multi-table DROP support, quoted identifier handling, sequence/IDENTITY restore, background auto-purge, size/count limits, and a per-user permission model.",
+   "version": "0.1.0",
+   "maintainer": [
+      "Caghan <https://github.com/CaghanTU>"
+   ],
+   "license": "MIT",
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "17.0.0"
+         }
+      }
+   },
+   "provides": {
+      "pg_flashback": {
+         "abstract": "Recycle bin for PostgreSQL tables",
+         "file": "pg_flashback--0.1.0.sql",
+         "docfile": "README.md",
+         "version": "0.1.0"
+      }
+   },
+   "resources": {
+      "homepage": "https://github.com/CaghanTU/pg_flashback",
+      "bugtracker": {
+         "web": "https://github.com/CaghanTU/pg_flashback/issues"
+      },
+      "repository": {
+         "url": "https://github.com/CaghanTU/pg_flashback.git",
+         "web": "https://github.com/CaghanTU/pg_flashback",
+         "type": "git"
+      }
+   },
+   "generated_by": "pg_flashback maintainer",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "recovery",
+      "recycle bin",
+      "drop table",
+      "truncate",
+      "safety",
+      "flashback",
+      "backup",
+      "rust",
+      "pgrx"
+   ]
+}
