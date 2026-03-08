@@ -75,10 +75,32 @@ unsafe extern "C-unwind" fn process_utility_hook(
         }
     };
 
+    // Detect DROP SCHEMA so we can capture tables before the schema is deleted.
+    let is_drop_schema = unsafe {
+        if pstmt.is_null() {
+            false
+        } else {
+            let utility = (*pstmt).utilityStmt;
+            if utility.is_null() {
+                false
+            } else {
+                let tag = (*(utility as *mut pg_sys::Node)).type_;
+                if tag == pg_sys::NodeTag::T_DropStmt {
+                    let drop = utility as *mut pg_sys::DropStmt;
+                    (*drop).removeType == pg_sys::ObjectType::OBJECT_SCHEMA
+                } else {
+                    false
+                }
+            }
+        }
+    };
+
     if is_drop_table {
         if let Some(query) = cstr_to_string(query_string) {
             let upper = query.to_uppercase();
-            let is_internal = upper.contains("FLASHBACK_RECYCLE") || upper.contains("FLASHBACK.OPERATIONS");
+            let is_internal = upper.contains("FLASHBACK_RECYCLE")
+                || upper.contains("FLASHBACK.OPERATIONS")
+                || upper.contains("PG_FLASHBACK_INTERNAL");
             if !is_internal {
                 if crate::ddl_capture::handle_drop_table(&query) {
                     return;
@@ -95,6 +117,17 @@ unsafe extern "C-unwind" fn process_utility_hook(
                 if crate::ddl_capture::handle_truncate_table(&query) {
                     return;
                 }
+            }
+        }
+    }
+
+    // Capture tables from DROP SCHEMA CASCADE before the schema is removed.
+    // We do this BEFORE delegating to standard_ProcessUtility so the tables still exist.
+    if is_drop_schema {
+        if let Some(query) = cstr_to_string(query_string) {
+            let upper = query.to_uppercase();
+            if !upper.contains("FLASHBACK") {
+                crate::ddl_capture::handle_drop_schema_cascade(&query);
             }
         }
     }

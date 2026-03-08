@@ -491,4 +491,523 @@ mod tests {
         Spi::run("RESET flashback.max_tables").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
     }
+
+    // Test 20: Dependent view DDL is saved and recreated on DROP restore
+    #[pg_test]
+    fn test_view_dependency_restored_after_drop() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_view_tbl CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_view_tbl (id int, status text)").unwrap();
+        Spi::run("INSERT INTO test_view_tbl VALUES (1, 'active'), (2, 'inactive')").unwrap();
+        Spi::run("CREATE OR REPLACE VIEW test_view_active AS \
+                  SELECT id, status FROM test_view_tbl WHERE status = 'active'").unwrap();
+
+        // Drop the table (and with it, the view)
+        Spi::run("DROP TABLE test_view_tbl CASCADE").unwrap();
+
+        // View DDL must have been captured in metadata
+        let meta: String = Spi::get_one::<String>(
+            "SELECT metadata::text FROM flashback.operations \
+             WHERE table_name = 'test_view_tbl' AND restored = false LIMIT 1"
+        ).unwrap().unwrap_or_default();
+        assert!(!meta.is_empty(), "metadata should contain view DDL");
+        assert!(meta.contains("test_view_active"), "metadata should reference the view name");
+
+        // Restore the table
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_view_tbl', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "DROP restore should succeed");
+
+        // Table rows must be back
+        let row_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_view_tbl"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(row_count, 2, "Both rows should be restored");
+
+        // View must be recreated
+        let view_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_views WHERE viewname = 'test_view_active')"
+        ).unwrap().unwrap_or(false);
+        assert!(view_exists, "Dependent view should be recreated after restore");
+
+        // View should return only the 'active' row
+        let view_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_view_active"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(view_count, 1, "View should return 1 active row");
+
+        Spi::run("DROP VIEW IF EXISTS test_view_active").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_view_tbl CASCADE").unwrap();
+        Spi::run("DELETE FROM flashback.operations WHERE table_name = 'test_view_tbl'").unwrap();
+    }
+
+    // Test 21: DROP TABLE IF EXISTS on a non-existent table is a no-op (not captured)
+    #[pg_test]
+    fn test_drop_table_if_exists_nonexistent() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+
+        let count_before = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations WHERE table_name = 'does_not_exist_ife' AND restored = false"
+        ).unwrap().unwrap_or(0);
+
+        // Should not error, and should not create a recycle-bin entry
+        Spi::run("DROP TABLE IF EXISTS does_not_exist_ife").unwrap();
+
+        let count_after = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations WHERE table_name = 'does_not_exist_ife' AND restored = false"
+        ).unwrap().unwrap_or(0);
+
+        assert_eq!(count_before, count_after, "DROP TABLE IF EXISTS on non-existent table must not create a recycle-bin entry");
+    }
+
+    // Test 22: TRUNCATE on multiple tables in a single statement — all are captured
+    #[pg_test]
+    fn test_multi_table_truncate_captured() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_multi_a CASCADE").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_multi_b CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_multi_a (id int)").unwrap();
+        Spi::run("CREATE TABLE test_multi_b (id int)").unwrap();
+        Spi::run("INSERT INTO test_multi_a VALUES (1), (2)").unwrap();
+        Spi::run("INSERT INTO test_multi_b VALUES (3), (4), (5)").unwrap();
+
+        // Truncate both in one statement
+        Spi::run("TRUNCATE TABLE test_multi_a, test_multi_b").unwrap();
+
+        let count_a = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations \
+             WHERE table_name = 'test_multi_a' AND operation_type = 'TRUNCATE' AND restored = false"
+        ).unwrap().unwrap_or(0);
+        let count_b = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations \
+             WHERE table_name = 'test_multi_b' AND operation_type = 'TRUNCATE' AND restored = false"
+        ).unwrap().unwrap_or(0);
+
+        assert_eq!(count_a, 1, "test_multi_a should have 1 TRUNCATE entry");
+        assert_eq!(count_b, 1, "test_multi_b should have 1 TRUNCATE entry");
+
+        // Restore both
+        let r_a = Spi::get_one::<bool>("SELECT flashback_restore('test_multi_a', NULL)")
+            .unwrap().unwrap_or(false);
+        let r_b = Spi::get_one::<bool>("SELECT flashback_restore('test_multi_b', NULL)")
+            .unwrap().unwrap_or(false);
+        assert!(r_a, "test_multi_a should restore");
+        assert!(r_b, "test_multi_b should restore");
+
+        let rows_a = Spi::get_one::<i64>("SELECT COUNT(*) FROM test_multi_a")
+            .unwrap().unwrap_or(0);
+        let rows_b = Spi::get_one::<i64>("SELECT COUNT(*) FROM test_multi_b")
+            .unwrap().unwrap_or(0);
+        assert_eq!(rows_a, 2, "test_multi_a should have 2 rows after restore");
+        assert_eq!(rows_b, 3, "test_multi_b should have 3 rows after restore");
+
+        Spi::run("DROP TABLE IF EXISTS test_multi_a, test_multi_b CASCADE").unwrap();
+        Spi::run("DELETE FROM flashback.operations WHERE table_name IN ('test_multi_a','test_multi_b')").unwrap();
+    }
+
+    // Test 23: DROP SCHEMA CASCADE captures tables inside the schema
+    #[pg_test]
+    fn test_drop_schema_cascade_captures_tables() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+        Spi::run("DROP SCHEMA IF EXISTS test_drop_schema CASCADE").unwrap();
+        Spi::run("CREATE SCHEMA test_drop_schema").unwrap();
+        Spi::run("CREATE TABLE test_drop_schema.tbl_one (id int)").unwrap();
+        Spi::run("CREATE TABLE test_drop_schema.tbl_two (id int)").unwrap();
+        Spi::run("INSERT INTO test_drop_schema.tbl_one VALUES (1),(2)").unwrap();
+
+        // Drop the entire schema
+        Spi::run("DROP SCHEMA test_drop_schema CASCADE").unwrap();
+
+        // Both tables should have been captured in the recycle bin
+        let captured = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations \
+             WHERE schema_name = 'test_drop_schema' AND restored = false"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(captured, 2, "Both tables inside the dropped schema should be in the recycle bin");
+
+        // Restore tbl_one — create the schema first since it was dropped
+        Spi::run("CREATE SCHEMA IF NOT EXISTS test_drop_schema").unwrap();
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('tbl_one', 'test_drop_schema')"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "tbl_one should be restorable after schema drop");
+
+        let rows = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_drop_schema.tbl_one"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(rows, 2, "tbl_one should have 2 rows after restore");
+
+        // Cleanup
+        Spi::run("DROP SCHEMA IF EXISTS test_drop_schema CASCADE").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+    }
+
+    // Test 24: Partitioned table IS captured with partition metadata in metadata JSON
+    #[pg_test]
+    fn test_partitioned_table_captured_with_metadata() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_part_parent CASCADE").unwrap();
+        Spi::run(
+            "CREATE TABLE test_part_parent (id int, region text) \
+             PARTITION BY LIST (region)"
+        ).unwrap();
+        Spi::run(
+            "CREATE TABLE test_part_eu PARTITION OF test_part_parent \
+             FOR VALUES IN ('EU')"
+        ).unwrap();
+        Spi::run(
+            "CREATE TABLE test_part_us PARTITION OF test_part_parent \
+             FOR VALUES IN ('US')"
+        ).unwrap();
+
+        // Drop the partitioned table (CASCADE also drops children)
+        Spi::run("DROP TABLE test_part_parent CASCADE").unwrap();
+
+        // Parent should be in recycle bin
+        let in_bin = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations \
+             WHERE table_name = 'test_part_parent' AND restored = false"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(in_bin, 1, "Partitioned table parent should be captured in recycle bin");
+
+        // Metadata should contain partition_info with children
+        let meta = Spi::get_one::<String>(
+            "SELECT metadata::text FROM flashback.operations \
+             WHERE table_name = 'test_part_parent' AND restored = false LIMIT 1"
+        ).unwrap().unwrap_or_default();
+        assert!(meta.contains("partition_info"), "metadata should contain partition_info");
+        assert!(meta.contains("test_part_eu") || meta.contains("test_part_us"),
+            "metadata should list child partitions");
+
+        // Child partitions should NOT appear as separate recycle bin entries
+        let child_in_bin = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations \
+             WHERE table_name IN ('test_part_eu','test_part_us') AND restored = false"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(child_in_bin, 0, "Child partitions should not have separate recycle bin entries");
+
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+    }
+
+    // Test 25: Multi-table DROP captures all tables
+    #[pg_test]
+    fn test_multi_table_drop_captured() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_multi_drop_a CASCADE").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_multi_drop_b CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_multi_drop_a (id int)").unwrap();
+        Spi::run("CREATE TABLE test_multi_drop_b (id int)").unwrap();
+        Spi::run("INSERT INTO test_multi_drop_a VALUES (1),(2)").unwrap();
+        Spi::run("INSERT INTO test_multi_drop_b VALUES (3),(4),(5)").unwrap();
+
+        // Drop both in a single statement
+        Spi::run("DROP TABLE test_multi_drop_a, test_multi_drop_b").unwrap();
+
+        let count_a = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations \
+             WHERE table_name = 'test_multi_drop_a' AND restored = false"
+        ).unwrap().unwrap_or(0);
+        let count_b = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations \
+             WHERE table_name = 'test_multi_drop_b' AND restored = false"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(count_a, 1, "test_multi_drop_a should be in recycle bin");
+        assert_eq!(count_b, 1, "test_multi_drop_b should be in recycle bin");
+
+        // Restore both
+        let r_a = Spi::get_one::<bool>("SELECT flashback_restore('test_multi_drop_a', NULL)")
+            .unwrap().unwrap_or(false);
+        let r_b = Spi::get_one::<bool>("SELECT flashback_restore('test_multi_drop_b', NULL)")
+            .unwrap().unwrap_or(false);
+        assert!(r_a, "test_multi_drop_a should restore");
+        assert!(r_b, "test_multi_drop_b should restore");
+
+        let rows_a = Spi::get_one::<i64>("SELECT COUNT(*) FROM test_multi_drop_a").unwrap().unwrap_or(0);
+        let rows_b = Spi::get_one::<i64>("SELECT COUNT(*) FROM test_multi_drop_b").unwrap().unwrap_or(0);
+        assert_eq!(rows_a, 2, "test_multi_drop_a should have 2 rows");
+        assert_eq!(rows_b, 3, "test_multi_drop_b should have 3 rows");
+
+        Spi::run("DROP TABLE IF EXISTS test_multi_drop_a, test_multi_drop_b CASCADE").unwrap();
+        Spi::run("DELETE FROM flashback.operations WHERE table_name IN ('test_multi_drop_a','test_multi_drop_b')").unwrap();
+    }
+
+    // Test 26: Triggers on the captured table survive restore (they travel with the physical table)
+    #[pg_test]
+    fn test_trigger_survives_drop_restore() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_trigger_tbl CASCADE").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_trigger_log CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_trigger_tbl (id SERIAL, val text)").unwrap();
+        Spi::run("CREATE TABLE test_trigger_log (logged_at timestamptz DEFAULT now())").unwrap();
+        Spi::run(
+            "CREATE OR REPLACE FUNCTION _pg_flashback_trig_fn() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN INSERT INTO test_trigger_log DEFAULT VALUES; RETURN NEW; END; $$"
+        ).unwrap();
+        Spi::run(
+            "CREATE TRIGGER test_trigger_trig \
+             AFTER INSERT ON test_trigger_tbl \
+             FOR EACH ROW EXECUTE FUNCTION _pg_flashback_trig_fn()"
+        ).unwrap();
+        Spi::run("INSERT INTO test_trigger_tbl (val) VALUES ('before_drop')").unwrap();
+
+        // Verify trigger fired once
+        let log_before = Spi::get_one::<i64>("SELECT COUNT(*) FROM test_trigger_log")
+            .unwrap().unwrap_or(0);
+        assert_eq!(log_before, 1, "Trigger should have fired once before drop");
+
+        // Drop and restore
+        Spi::run("DROP TABLE test_trigger_tbl").unwrap();
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_trigger_tbl', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "Trigger table should restore successfully");
+
+        // Trigger should still be attached after restore
+        let trig_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgname = 'test_trigger_trig')"
+        ).unwrap().unwrap_or(false);
+        assert!(trig_exists, "Trigger should survive DROP+restore (travels with physical table)");
+
+        // Trigger should fire on new insert
+        Spi::run("INSERT INTO test_trigger_tbl (val) VALUES ('after_restore')").unwrap();
+        let log_after = Spi::get_one::<i64>("SELECT COUNT(*) FROM test_trigger_log")
+            .unwrap().unwrap_or(0);
+        assert_eq!(log_after, 2, "Trigger should fire again after restore");
+
+        Spi::run("DROP TABLE IF EXISTS test_trigger_tbl CASCADE").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_trigger_log CASCADE").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+        Spi::run("DROP FUNCTION IF EXISTS _pg_flashback_trig_fn() CASCADE").unwrap();
+        Spi::run("DELETE FROM flashback.operations WHERE table_name = 'test_trigger_tbl'").unwrap();
+    }
+
+    // Test 27: FK constraints on OTHER tables referencing this table are captured in metadata
+    #[pg_test]
+    fn test_incoming_fk_captured_in_metadata() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_fk_child CASCADE").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_fk_parent CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_fk_parent (id SERIAL PRIMARY KEY, name text)").unwrap();
+        Spi::run(
+            "CREATE TABLE test_fk_child (id SERIAL PRIMARY KEY, parent_id INT \
+             REFERENCES test_fk_parent(id) ON DELETE CASCADE)"
+        ).unwrap();
+        Spi::run("INSERT INTO test_fk_parent (name) VALUES ('Alice'),('Bob')").unwrap();
+        Spi::run("INSERT INTO test_fk_child (parent_id) VALUES (1),(2)").unwrap();
+
+        // Drop the PARENT (child's FK reference disappears)
+        Spi::run("DROP TABLE test_fk_parent CASCADE").unwrap();
+
+        // FK info should be in metadata
+        let meta = Spi::get_one::<String>(
+            "SELECT metadata::text FROM flashback.operations \
+             WHERE table_name = 'test_fk_parent' AND restored = false LIMIT 1"
+        ).unwrap().unwrap_or_default();
+        assert!(meta.contains("incoming_fks"), "metadata should contain incoming_fks key");
+        assert!(meta.contains("test_fk_child"), "metadata should reference the child table");
+
+        // Cleanup
+        Spi::run("DROP TABLE IF EXISTS test_fk_child CASCADE").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+    }
+
+    // Test 28b: Incoming FK constraints remain intact after DROP restore
+    // pg_flashback moves the parent via ALTER TABLE SET SCHEMA (not DROP), so the FK
+    // is never dropped — it keeps pointing at the parent by OID throughout.
+    // After restore the FK must still reference the correct parent in the correct schema.
+    #[pg_test]
+    fn test_incoming_fk_restored_end_to_end() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_fke_child CASCADE").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_fke_parent CASCADE").unwrap();
+        Spi::run(
+            "CREATE TABLE test_fke_parent (id SERIAL PRIMARY KEY, name text)"
+        ).unwrap();
+        Spi::run(
+            "CREATE TABLE test_fke_child (id SERIAL PRIMARY KEY, \
+             parent_id INT REFERENCES test_fke_parent(id) ON DELETE CASCADE)"
+        ).unwrap();
+        Spi::run("INSERT INTO test_fke_parent (name) VALUES ('Alice'),('Bob')").unwrap();
+        Spi::run("INSERT INTO test_fke_child (parent_id) VALUES (1),(2)").unwrap();
+
+        // DROP parent — our hook absorbs the DROP via SET SCHEMA, so the FK is NOT
+        // dropped (parent is moved, not deleted). The FK keeps its OID reference.
+        Spi::run("DROP TABLE test_fke_parent CASCADE").unwrap();
+
+        // Restore parent
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_fke_parent', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "Parent table should restore successfully");
+
+        // Parent data should be back
+        let row_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_fke_parent"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(row_count, 2, "Parent should have 2 rows after restore");
+
+        // FK constraint must exist on the child table
+        let fk_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS( \
+               SELECT 1 FROM pg_constraint c \
+               JOIN pg_class t ON t.oid = c.conrelid \
+               WHERE t.relname = 'test_fke_child' AND c.contype = 'f')"
+        ).unwrap().unwrap_or(false);
+        assert!(fk_exists, "FK constraint must exist on child table after restore");
+
+        // FK must reference the restored parent (now back in its original schema)
+        let fk_refs_parent = Spi::get_one::<bool>(
+            "SELECT EXISTS( \
+               SELECT 1 FROM pg_constraint c \
+               JOIN pg_class t ON t.oid = c.conrelid \
+               JOIN pg_class r ON r.oid = c.confrelid \
+               JOIN pg_namespace rn ON rn.oid = r.relnamespace \
+               WHERE t.relname = 'test_fke_child' \
+                 AND r.relname = 'test_fke_parent' \
+                 AND rn.nspname = 'public' \
+                 AND c.contype = 'f')"
+        ).unwrap().unwrap_or(false);
+        assert!(fk_refs_parent, "FK must reference test_fke_parent in public schema after restore");
+
+        Spi::run("DROP TABLE IF EXISTS test_fke_child CASCADE").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_fke_parent CASCADE").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+    }
+
+    // Test 28: RLS policies are captured in metadata and restored after DROP restore
+    #[pg_test]
+    fn test_rls_policy_captured_and_restored() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_rls_tbl CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_rls_tbl (id int, owner text)").unwrap();
+        Spi::run("ALTER TABLE test_rls_tbl ENABLE ROW LEVEL SECURITY").unwrap();
+        Spi::run(
+            "CREATE POLICY test_rls_pol ON test_rls_tbl \
+             FOR SELECT TO PUBLIC USING (owner = current_user)"
+        ).unwrap();
+        Spi::run("INSERT INTO test_rls_tbl VALUES (1, 'postgres')").unwrap();
+
+        // Drop the table
+        Spi::run("DROP TABLE test_rls_tbl CASCADE").unwrap();
+
+        // RLS policy should be in metadata
+        let meta = Spi::get_one::<String>(
+            "SELECT metadata::text FROM flashback.operations \
+             WHERE table_name = 'test_rls_tbl' AND restored = false LIMIT 1"
+        ).unwrap().unwrap_or_default();
+        assert!(meta.contains("rls_policies"), "metadata should contain rls_policies key");
+        assert!(meta.contains("test_rls_pol"), "metadata should reference the policy name");
+
+        // Restore
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_rls_tbl', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "RLS table should restore successfully");
+
+        // Policy should be recreated
+        let policy_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_policy \
+             JOIN pg_class ON pg_class.oid = pg_policy.polrelid \
+             WHERE pg_class.relname = 'test_rls_tbl' AND polname = 'test_rls_pol')"
+        ).unwrap().unwrap_or(false);
+        assert!(policy_exists, "RLS policy should be recreated after restore");
+
+        Spi::run("DROP TABLE IF EXISTS test_rls_tbl CASCADE").unwrap();
+        Spi::run("DELETE FROM flashback.operations WHERE table_name = 'test_rls_tbl'").unwrap();
+    }
+
+    // Test 29: Partition children are restored (co-moved) when parent is restored
+    #[pg_test]
+    fn test_partitioned_children_restored_with_parent() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_part_restore_p CASCADE").unwrap();
+        Spi::run(
+            "CREATE TABLE test_part_restore_p (id int, region text) PARTITION BY LIST (region)"
+        ).unwrap();
+        Spi::run(
+            "CREATE TABLE test_part_restore_eu PARTITION OF test_part_restore_p \
+             FOR VALUES IN ('EU')"
+        ).unwrap();
+        Spi::run(
+            "CREATE TABLE test_part_restore_us PARTITION OF test_part_restore_p \
+             FOR VALUES IN ('US')"
+        ).unwrap();
+        Spi::run("INSERT INTO test_part_restore_p VALUES (1,'EU'),(2,'US')").unwrap();
+
+        // Drop parent CASCADE
+        Spi::run("DROP TABLE test_part_restore_p CASCADE").unwrap();
+
+        // Restore parent
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_part_restore_p', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "Partitioned parent should restore");
+
+        // Children must exist after restore (co-moved or recreated)
+        let eu_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE tablename = 'test_part_restore_eu')"
+        ).unwrap().unwrap_or(false);
+        let us_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE tablename = 'test_part_restore_us')"
+        ).unwrap().unwrap_or(false);
+        assert!(eu_exists, "EU partition should exist after parent restore");
+        assert!(us_exists, "US partition should exist after parent restore");
+
+        // Partitioned table should be fully functional (routing works)
+        Spi::run("INSERT INTO test_part_restore_p VALUES (10,'EU'),(11,'US')").unwrap();
+        let total = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_part_restore_p"
+        ).unwrap().unwrap_or(0);
+        // total >= 2 (new inserts) — original data preserved if co-moved, or 2 if recreated empty
+        assert!(total >= 2, "Should be able to insert into restored partitioned table");
+
+        Spi::run("DROP TABLE IF EXISTS test_part_restore_p CASCADE").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+    }
+
+    // Test 30: flashback_restore_schema restores all tables from a given schema
+    #[pg_test]
+    fn test_restore_schema_bulk() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+        Spi::run("DROP SCHEMA IF EXISTS test_bulk_schema CASCADE").unwrap();
+        Spi::run("CREATE SCHEMA test_bulk_schema").unwrap();
+        Spi::run("CREATE TABLE test_bulk_schema.tbl_a (id int, val text)").unwrap();
+        Spi::run("CREATE TABLE test_bulk_schema.tbl_b (id int, val text)").unwrap();
+        Spi::run("INSERT INTO test_bulk_schema.tbl_a VALUES (1,'a'),(2,'b')").unwrap();
+        Spi::run("INSERT INTO test_bulk_schema.tbl_b VALUES (3,'c')").unwrap();
+
+        // Drop both tables individually
+        Spi::run("DROP TABLE test_bulk_schema.tbl_a").unwrap();
+        Spi::run("DROP TABLE test_bulk_schema.tbl_b").unwrap();
+
+        let in_bin = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations \
+             WHERE schema_name = 'test_bulk_schema' AND restored = false"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(in_bin, 2, "Both tables should be in recycle bin");
+
+        // Bulk-restore all tables in the schema
+        let restored_count = Spi::get_one::<i64>(
+            "SELECT flashback_restore_schema('test_bulk_schema', NULL)"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(restored_count, 2, "Both tables should be restored by schema restore");
+
+        // Verify data is back
+        let count_a = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_bulk_schema.tbl_a"
+        ).unwrap().unwrap_or(0);
+        let count_b = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_bulk_schema.tbl_b"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(count_a, 2, "tbl_a should have 2 rows");
+        assert_eq!(count_b, 1, "tbl_b should have 1 row");
+
+        Spi::run("DROP SCHEMA IF EXISTS test_bulk_schema CASCADE").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+    }
 }
