@@ -2,6 +2,8 @@
 name = "pg_flashback"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/CaghanTU/pg_flashback"
 
 [lib]
 name = "pg_flashback"
