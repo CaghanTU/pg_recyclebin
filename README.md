@@ -55,6 +55,23 @@ cd pg_flashback
 ./install.sh
 ```
 
+### First-time setup checklist
+
+1. PostgreSQL is running with `shared_preload_libraries = 'pg_flashback'`.
+2. PostgreSQL is restarted after changing `shared_preload_libraries`.
+3. Extension is created in the target database:
+
+```sql
+CREATE EXTENSION pg_flashback;
+```
+
+4. Optional but recommended for non-`postgres` databases: configure the worker connection DB.
+
+```sql
+ALTER SYSTEM SET flashback.database_name = 'your_database_name';
+SELECT pg_reload_conf();
+```
+
 Then load the extension in PostgreSQL:
 
 ```sql
@@ -132,8 +149,6 @@ SELECT flashback_restore_by_id(3);
 SELECT flashback_restore_by_id(3, 'archive');
 ```
 
-Backward-compatible alias: `flashback_restore_by_op_id(op_id, target_schema)`.
-
 ---
 
 ### `flashback_purge(table_name text)`
@@ -155,8 +170,6 @@ Permanently removes a specific entry from the recycle bin by operation ID.
 ```sql
 SELECT flashback_purge_by_id(42);
 ```
-
-Backward-compatible alias: `flashback_purge_by_op_id(op_id)`.
 
 Returns `true` on success. Regular users can only purge their own entries.
 
@@ -183,6 +196,22 @@ SELECT flashback_restore_all();
 ```
 
 Returns the count of successfully restored tables. Schemas that no longer exist are automatically recreated. Superusers restore all entries; regular users restore only the tables they dropped themselves. Tables are restored newest-first so that a DROP followed by a TRUNCATE on the same table is always handled in the correct order.
+
+---
+
+### `flashback_restore_schema(schema_name text, target_schema text DEFAULT NULL)`
+
+Restores all unrecovered entries that originally belong to one schema.
+
+```sql
+-- Restore everything back to its original schema name
+SELECT flashback_restore_schema('sales', NULL);
+
+-- Restore everything from one source schema into another destination schema
+SELECT flashback_restore_schema('sales', 'sales_restored');
+```
+
+Returns the number of successfully restored tables.
 
 ---
 
@@ -301,3 +330,12 @@ pg_flashback creates two schemas on install:
 - **TRUNCATE on large tables**: the backup is a full data copy (`CREATE TABLE ... AS SELECT *`). On very large tables this will consume additional disk space equal to the original table size and may take noticeable time. For tables in that size range consider excluding the schema via `flashback.excluded_schemas`.
 - When a partitioned table's child partitions are missing after restore (edge case: child was in a different schema that was also dropped), pg_flashback recreates the partition shell but the original data is gone — a `WARNING` is emitted.
 - Materialized views dependent on a dropped table are dropped along with it (on `CASCADE`) and **recreated** on restore — same as regular views.
+
+---
+
+## Function Name Variants
+
+For operation-ID based flows, both names are available and equivalent:
+
+- `flashback_restore_by_id` and `flashback_restore_by_op_id`
+- `flashback_purge_by_id` and `flashback_purge_by_op_id`
