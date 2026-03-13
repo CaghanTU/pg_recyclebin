@@ -18,7 +18,7 @@ A PostgreSQL extension that adds a **recycle bin** for dropped tables. Instead o
   - RLS policies are captured and re-applied, with `ENABLE ROW LEVEL SECURITY` if needed
   - Triggers survive restore automatically (they travel with the physical table)
   - Partitioned tables: children are co-moved and re-attached; missing partitions are recreated as empty shells with a warning
-- Quoted identifiers fully supported: `DROP TABLE "My Schema"."My Table"` works correctly
+- Quoted identifiers fully supported: table and schema names with hyphens, spaces, or special characters work correctly (e.g. `DROP TABLE "my-table"`, `DROP TABLE "My Schema"."My Table"`)
 - Sequence / IDENTITY column state automatically restored after DROP and TRUNCATE recovery
 - FIFO eviction when table count or total size limits are reached
 - Background worker that automatically purges expired entries
@@ -29,12 +29,21 @@ A PostgreSQL extension that adds a **recycle bin** for dropped tables. Instead o
 
 ---
 
+## Compatibility
+
+| PostgreSQL | Status |
+|---|---|
+| 18 | Supported |
+| 17 | Supported |
+| 16 | Supported |
+| 15 | Supported |
+| 14 | Supported |
+
 ## Requirements
 
-- PostgreSQL 17
+- PostgreSQL 14 – 18
 - pgrx 0.16.1
 - Rust (stable)
-- Rocky 9
 
 ---
 
@@ -60,12 +69,7 @@ CREATE EXTENSION pg_flashback;
 
 ## How It Works
 
-1. pg_flashback registers a DDL hook that fires on every `DROP TABLE` and `TRUNCATE TABLE`.
-2. On `DROP TABLE`: the table is moved to the `flashback_recycle` schema and renamed with a unique op_id suffix (e.g. `orders_42`).
-3. On `TRUNCATE TABLE`: the data is copied into a backup table in `flashback_recycle` before truncation runs.
-4. Metadata is recorded in the `flashback.operations` table (original schema, table name, owner, operation type, retention deadline, etc.).
-5. A background worker periodically scans `flashback.operations` and purges entries that have exceeded their retention period.
-6. FIFO eviction runs before each capture: if the table count or total size limit is reached, the oldest entry is removed to make room.
+A DDL hook fires on every `DROP TABLE` and `TRUNCATE TABLE`. On `DROP`, the table is moved to `flashback_recycle` and renamed with a unique op_id suffix. On `TRUNCATE`, the data is copied to `flashback_recycle` before truncation proceeds. Metadata (original schema, owner, operation type, retention deadline) is written to `flashback.operations`. A background worker periodically purges expired entries; FIFO eviction runs before each capture if a size or count limit is reached.
 
 ---
 
@@ -128,6 +132,8 @@ SELECT flashback_restore_by_id(3);
 SELECT flashback_restore_by_id(3, 'archive');
 ```
 
+Backward-compatible alias: `flashback_restore_by_op_id(op_id, target_schema)`.
+
 ---
 
 ### `flashback_purge(table_name text)`
@@ -150,6 +156,8 @@ Permanently removes a specific entry from the recycle bin by operation ID.
 SELECT flashback_purge_by_id(42);
 ```
 
+Backward-compatible alias: `flashback_purge_by_op_id(op_id)`.
+
 Returns `true` on success. Regular users can only purge their own entries.
 
 ---
@@ -163,6 +171,18 @@ SELECT flashback_purge_all();
 ```
 
 Returns the number of tables that were purged. Superusers purge everything; regular users purge only their own tables.
+
+---
+
+### `flashback_restore_all()`
+
+Restores **all** tables currently in the recycle bin to their original schemas in a single call. Useful after a mass-drop incident (e.g. accidental `DROP SCHEMA ... CASCADE` across multiple schemas).
+
+```sql
+SELECT flashback_restore_all();
+```
+
+Returns the count of successfully restored tables. Schemas that no longer exist are automatically recreated. Superusers restore all entries; regular users restore only the tables they dropped themselves. Tables are restored newest-first so that a DROP followed by a TRUNCATE on the same table is always handled in the correct order.
 
 ---
 
@@ -198,6 +218,7 @@ All settings are adjustable at runtime without restarting PostgreSQL (requires s
 | `flashback.max_size` | `102400` (100 GB) | 1 – 1048576 MB | Maximum total size of the recycle bin |
 | `flashback.worker_interval_seconds` | `60` | 10 – 86400 | How often the cleanup worker runs |
 | `flashback.excluded_schemas` | *(empty)* | — | Comma-separated list of schemas to exclude |
+| `flashback.database_name` | `postgres` | — | Database the background worker connects to; set this when pg_flashback is installed in a database other than `postgres` |
 
 ### Examples
 
@@ -216,6 +237,9 @@ ALTER SYSTEM SET flashback.worker_interval_seconds = 600;
 
 -- Exclude staging and temp schemas from the recycle bin
 ALTER SYSTEM SET flashback.excluded_schemas = 'staging,temp_data';
+
+-- Tell the background worker to connect to a non-default database
+ALTER SYSTEM SET flashback.database_name = 'myapp';
 
 -- Apply without restart
 SELECT pg_reload_conf();
@@ -238,7 +262,7 @@ All public functions are `SECURITY DEFINER` so that regular users can access the
 
 ## TRUNCATE Support
 
-pg_flashback also intercepts `TRUNCATE TABLE`. Before the truncation runs, the current data is copied into a backup table in the `flashback_recycle` schema. The actual `TRUNCATE` then executes normally, leaving the table empty.
+pg_flashback intercepts `TRUNCATE TABLE`: before the truncation runs, the current data is copied into a backup table in `flashback_recycle`. The actual `TRUNCATE` executes normally, leaving the table empty.
 
 ```sql
 TRUNCATE TABLE orders;
@@ -248,12 +272,6 @@ SELECT * FROM flashback_list_recycled_tables();  -- backup entry visible
 SELECT flashback_restore('orders', NULL);        -- data restored
 SELECT * FROM orders;                            -- rows are back
 ```
-
-| | DROP TABLE | TRUNCATE TABLE |
-|---|---|---|
-| Table after operation | Gone | Empty, still exists |
-| What pg_flashback saves | The whole table | A copy of the data |
-| How restore works | Moves table back | `INSERT INTO ... SELECT * FROM backup` |
 
 ---
 
@@ -282,4 +300,4 @@ pg_flashback creates two schemas on install:
 - `flashback_purge` removes only the most recently dropped version; use `flashback_purge_by_id` to remove a specific version.
 - **TRUNCATE on large tables**: the backup is a full data copy (`CREATE TABLE ... AS SELECT *`). On very large tables this will consume additional disk space equal to the original table size and may take noticeable time. For tables in that size range consider excluding the schema via `flashback.excluded_schemas`.
 - When a partitioned table's child partitions are missing after restore (edge case: child was in a different schema that was also dropped), pg_flashback recreates the partition shell but the original data is gone — a `WARNING` is emitted.
-- Materialized views are not captured (only regular views).
+- Materialized views dependent on a dropped table are dropped along with it (on `CASCADE`) and **recreated** on restore — same as regular views.

@@ -1,7 +1,21 @@
 #!/bin/bash
 set -e
 
-SQL_FILE=/usr/local/pgsql-17/share/extension/pg_flashback--0.1.0.sql
+# Parse flags
+REINSTALL=false
+for arg in "$@"; do
+    case "$arg" in
+        -r|--reinstall) REINSTALL=true ;;
+        *) echo "Unknown argument: $arg"; echo "Usage: $0 [-r|--reinstall]"; exit 1 ;;
+    esac
+done
+
+if ! command -v pg_config &>/dev/null; then
+    echo "ERROR: pg_config not found. Make sure PostgreSQL bin directory is in your PATH."
+    exit 1
+fi
+
+SQL_FILE="$(pg_config --sharedir)/extension/pg_flashback--0.1.0.sql"
 
 cargo pgrx install
 
@@ -87,11 +101,27 @@ EOF
 # PostgreSQL holds the old shared library in memory via dlopen cache.
 echo "Restarting PostgreSQL to load new shared library..."
 if command -v pg_ctl &>/dev/null; then
-    PGDATA="${PGDATA:-/usr/local/pgsql-17/data}"
+    PGDATA="${PGDATA:-$(pg_config --bindir)/../data}"
     pg_ctl -D "$PGDATA" restart -w -s && echo "PostgreSQL restarted." || echo "pg_ctl restart failed — restart PostgreSQL manually before running CREATE EXTENSION."
 elif command -v systemctl &>/dev/null && systemctl is-active --quiet postgresql 2>/dev/null; then
     systemctl restart postgresql && echo "PostgreSQL restarted." || echo "systemctl restart failed — restart PostgreSQL manually."
 else
     echo "WARNING: Could not restart PostgreSQL automatically."
     echo "         Please restart it manually before running CREATE EXTENSION pg_flashback."
+fi
+
+if [ "$REINSTALL" = true ]; then
+    PSQL_BIN="$(pg_config --bindir)/psql"
+    PSQL_DB="${PGDATABASE:-postgres}"
+    PSQL_USER="${PGUSER:-postgres}"
+    echo "Reinstalling extension (DROP CASCADE + CREATE)..."
+    "$PSQL_BIN" -U "$PSQL_USER" -d "$PSQL_DB" -c "DROP EXTENSION IF EXISTS pg_flashback CASCADE;" \
+        && echo "Old extension dropped." \
+        || echo "WARNING: DROP EXTENSION failed — continuing anyway."
+    "$PSQL_BIN" -U "$PSQL_USER" -d "$PSQL_DB" -c "CREATE EXTENSION pg_flashback;" \
+        && echo "Extension created." \
+        || echo "ERROR: CREATE EXTENSION failed."
+else
+    echo "Run 'CREATE EXTENSION pg_flashback;' in psql to activate."
+    echo "For a fresh reinstall use: $0 --reinstall"
 fi

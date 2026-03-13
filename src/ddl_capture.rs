@@ -1,11 +1,33 @@
 use pgrx::prelude::*;
 use crate::guc;
+use crate::context::qi;
 
-/// Returns JSON array of FK constraints defined on OTHER tables that reference this table.
-/// Each entry: { "table": "schema.tblname", "def": "ALTER TABLE ... ADD CONSTRAINT ..." }
-/// These are captured so we can warn or restore them after the table is brought back.
-/// Note: constraints ON the captured table itself travel with the physical table;
-/// only constraints on FOREIGN tables referencing us are lost when we disappear.
+const FLASHBACK_BIN_LOCK_KEY: i64 = 846271;
+
+fn acquire_flashback_bin_lock() {
+    let _ = Spi::run(&format!("SELECT pg_advisory_xact_lock({})", FLASHBACK_BIN_LOCK_KEY));
+}
+
+fn with_suffix_63(base: &str, suffix: &str) -> String {
+    let max_ident_len = 63usize;
+    if base.len() + suffix.len() <= max_ident_len {
+        return format!("{}{}", base, suffix);
+    }
+
+    let keep_bytes = max_ident_len.saturating_sub(suffix.len());
+    let mut kept = String::new();
+    for ch in base.chars() {
+        let ch_len = ch.len_utf8();
+        if kept.len() + ch_len > keep_bytes {
+            break;
+        }
+        kept.push(ch);
+    }
+    format!("{}{}", kept, suffix)
+}
+
+// FK constraints from other tables pointing at this table. The table's own constraints
+// travel with it on SET SCHEMA; only incoming FKs need to be recaptured.
 fn capture_incoming_fks(schema: &str, table: &str) -> Vec<serde_json::Value> {
     let json_str = Spi::get_one::<String>(&format!(
         "SELECT COALESCE( \
@@ -33,9 +55,6 @@ fn capture_incoming_fks(schema: &str, table: &str) -> Vec<serde_json::Value> {
     serde_json::from_str::<Vec<serde_json::Value>>(&json_str).unwrap_or_default()
 }
 
-/// Returns JSON array of RLS policies on this table.
-/// Each entry: { "name": "...", "cmd": "...", "roles": "...", "qual": "...", "with_check": "..." }
-/// PostgreSQL drops policies when the table is dropped; we need to recreate them on restore.
 fn capture_rls_policies(schema: &str, table: &str) -> Vec<serde_json::Value> {
     let json_str = Spi::get_one::<String>(&format!(
         "SELECT COALESCE( \
@@ -68,10 +87,6 @@ fn capture_rls_policies(schema: &str, table: &str) -> Vec<serde_json::Value> {
     serde_json::from_str::<Vec<serde_json::Value>>(&json_str).unwrap_or_default()
 }
 
-/// Returns partition info if this table is a partitioned parent.
-/// { "is_partitioned": true, "strategy": "RANGE|LIST|HASH",
-///   "children": [ { "schema": "...", "name": "...",
-///                   "def": "CREATE TABLE ... PARTITION OF ... FOR VALUES ..." } ] }
 fn capture_partition_info(schema: &str, table: &str) -> Option<serde_json::Value> {
     // Check if this is a partitioned parent (relkind = 'p')
     let is_partitioned = Spi::get_one::<bool>(&format!(
@@ -134,23 +149,19 @@ fn capture_partition_info(schema: &str, table: &str) -> Option<serde_json::Value
     }))
 }
 
-/// Queries pg_depend for all views that directly depend on `table` in `schema`.
-/// PostgreSQL stores view→table dependencies via pg_rewrite entries, so we join:
-///   pg_depend.objid → pg_rewrite.oid → pg_rewrite.ev_class → pg_class (view)
-/// Returns a serde_json array (may be empty) — called before the table is moved.
 fn capture_dependent_views(schema: &str, table: &str) -> Vec<serde_json::Value> {
-    // Use string_agg → Spi::get_one so we avoid Spi::connect inside a hook context.
     let json_str = Spi::get_one::<String>(&format!(
         "SELECT COALESCE( \
              jsonb_agg(jsonb_build_object( \
                  'schema', n.nspname, \
                  'name',   v.relname, \
+                 'kind',   v.relkind::text, \
                  'def',    pg_get_viewdef(v.oid, true) \
              )), '[]'::jsonb)::text \
          FROM pg_depend d \
          JOIN pg_rewrite r  ON r.oid = d.objid \
                            AND d.classid = 'pg_rewrite'::regclass \
-         JOIN pg_class   v  ON v.oid = r.ev_class AND v.relkind = 'v' \
+         JOIN pg_class   v  ON v.oid = r.ev_class AND v.relkind IN ('v', 'm') \
          JOIN pg_namespace n ON n.oid = v.relnamespace \
          WHERE d.refobjid = ( \
              SELECT c.oid FROM pg_class c \
@@ -167,27 +178,33 @@ fn capture_dependent_views(schema: &str, table: &str) -> Vec<serde_json::Value> 
     serde_json::from_str::<Vec<serde_json::Value>>(&json_str).unwrap_or_default()
 }
 
-/// Core inner function: moves a single verified regular table into flashback_recycle.
-/// Callers MUST have already done: extension check, injection check, temp-table skip,
-/// partition skip, and excluded-schema skip.
-fn capture_drop_inner(schema: &str, bare_table: &str) -> bool {
+fn capture_drop_inner(schema: &str, bare_table: &str, cascade: bool) -> bool {
     enforce_table_limit();
     enforce_size_limit();
 
-    // Capture dependent views before the table is moved (they'll be dropped by PG otherwise).
-    let dep_views = capture_dependent_views(schema, bare_table);
-    // Capture FK constraints from OTHER tables that reference this table.
-    let incoming_fks = capture_incoming_fks(schema, bare_table);
-    // Capture RLS policies (dropped by PG when the table is dropped).
-    let rls_policies = capture_rls_policies(schema, bare_table);
-    // Capture partition metadata if this is a partitioned parent.
+    let dep_views     = capture_dependent_views(schema, bare_table);
+    let incoming_fks  = capture_incoming_fks(schema, bare_table);
+    let rls_policies  = capture_rls_policies(schema, bare_table);
     let partition_info = capture_partition_info(schema, bare_table);
+
+    // If dependent views exist and the user did NOT specify CASCADE, let PostgreSQL handle it
+    // naturally — it will emit "cannot drop ... because other objects depend on it".
+    // For CASCADE: we proceed with capture (table saved to recycle bin), then explicitly drop
+    // the views so they don't survive pointing at flashback_recycle (Bug I fix).
+    // View definitions are preserved in metadata and recreated on restore.
+    if !dep_views.is_empty() && !cascade {
+        return false;
+    }
 
     // Reserve a unique op_id; use it as the recycled_name suffix.
     let reserve_sql = format!(
         "INSERT INTO flashback.operations \
-         (operation_type, schema_name, table_name, recycled_name, role_name, retention_until) \
-         VALUES ('DROP', '{}', '{}', '', current_user, now() + interval '{} days') \
+         (operation_type, schema_name, table_name, recycled_name, role_name, retention_until, \
+          query_text, application_name, client_addr) \
+         VALUES ('DROP', '{}', '{}', '', current_user, now() + interval '{} days', \
+          COALESCE(current_query(), ''), \
+          COALESCE(current_setting('application_name', true), ''), \
+          COALESCE(inet_client_addr()::text, '')) \
          RETURNING op_id",
         schema, bare_table, guc::get_retention_days()
     );
@@ -199,10 +216,11 @@ fn capture_drop_inner(schema: &str, bare_table: &str) -> bool {
         }
     };
 
-    let recycled_name = format!("{}_{}", bare_table, op_id);
+    let op_suffix = format!("_{}", op_id);
+    let recycled_name = with_suffix_63(bare_table, &op_suffix);
 
-    let move_sql   = format!("ALTER TABLE {}.{} SET SCHEMA flashback_recycle", schema, bare_table);
-    let rename_sql = format!("ALTER TABLE flashback_recycle.{} RENAME TO {}", bare_table, recycled_name);
+    let move_sql   = format!("ALTER TABLE {}.{} SET SCHEMA flashback_recycle", qi(schema), qi(bare_table));
+    let rename_sql = format!("ALTER TABLE flashback_recycle.{} RENAME TO {}", qi(bare_table), qi(&recycled_name));
 
     if let Err(e) = Spi::run(&move_sql) {
         pgrx::warning!("Move error: {}", e);
@@ -215,39 +233,53 @@ fn capture_drop_inner(schema: &str, bare_table: &str) -> bool {
         return false;
     }
 
-    // Rename owned sequences with op_id suffix to prevent collisions on re-drop.
-    let mut seq_names: Vec<String> = Vec::new();
-    let _ = Spi::connect(|client| {
-        let rows = client.select(
-            &format!(
-                "SELECT s.relname \
-                 FROM pg_depend d \
-                 JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
-                 JOIN pg_class t ON t.oid = d.refobjid AND t.relname = '{}' \
-                 WHERE d.deptype IN ('a', 'i') \
-                   AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'flashback_recycle')",
-                recycled_name
-            ),
-            None, &[],
-        )?;
-        for row in rows {
-            if let Ok(Some(n)) = row.get::<String>(1) {
-                seq_names.push(n);
-            }
-        }
-        Ok::<_, pgrx::spi::Error>(())
-    });
-    for seq_name in &seq_names {
-        let new_seq_name = format!("{}_{}", seq_name, op_id);
+    // Append op_id suffix to owned sequences to avoid name collisions on re-drop.
+    // Use Spi::get_one with string_agg to avoid Spi::connect visibility issues after DDL.
+    // chr(1) (SOH) separator: PG identifiers cannot contain SOH bytes, safe even for
+    // quoted names that include commas (e.g. "a,b").
+    let seq_names_csv = Spi::get_one::<String>(&format!(
+        "SELECT COALESCE(string_agg(s.relname, chr(1)), '') \
+         FROM pg_depend d \
+         JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
+         JOIN pg_class t ON t.oid = d.refobjid AND t.relname = '{}' \
+         WHERE d.deptype IN ('a', 'i') \
+           AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'flashback_recycle')",
+        recycled_name
+    ))
+    .unwrap_or(None)
+    .unwrap_or_default();
+    for seq_name in seq_names_csv.split('\x01').filter(|s| !s.is_empty()) {
+        let new_seq_name = with_suffix_63(seq_name, &op_suffix);
         if let Err(e) = Spi::run(&format!(
             "ALTER SEQUENCE flashback_recycle.{} RENAME TO {}",
-            seq_name, new_seq_name
+            qi(seq_name), qi(&new_seq_name)
         )) {
             pgrx::warning!("Failed to rename sequence '{}': {}", seq_name, e);
         }
     }
 
-    // Build metadata object: always include all keys (empty arrays are fine).
+    // Append op_id suffix to indexes to avoid name collisions in flashback_recycle on re-drop.
+    let idx_names_csv = Spi::get_one::<String>(&format!(
+        "SELECT COALESCE(string_agg(indexname, chr(1)), '') \
+         FROM pg_indexes \
+         WHERE schemaname = 'flashback_recycle' AND tablename = '{}'",
+        recycled_name
+    ))
+    .unwrap_or(None)
+    .unwrap_or_default();
+    for idx_name in idx_names_csv.split('\x01').filter(|s| !s.is_empty()) {
+        let new_idx_name = with_suffix_63(idx_name, &op_suffix);
+        if let Err(e) = Spi::run(&format!(
+            "ALTER INDEX flashback_recycle.{} RENAME TO {}",
+            qi(idx_name), qi(&new_idx_name)
+        )) {
+            pgrx::warning!("Failed to rename index '{}': {}", idx_name, e);
+        }
+    }
+
+    // Persist metadata.
+    // Clone dep_views before moving into meta_obj so we can drop the views after saving.
+    let dep_views_to_drop = dep_views.clone();
     let mut meta_obj = serde_json::Map::new();
     meta_obj.insert("views".into(), serde_json::Value::Array(dep_views));
     meta_obj.insert("incoming_fks".into(), serde_json::Value::Array(incoming_fks));
@@ -263,7 +295,31 @@ fn capture_drop_inner(schema: &str, bare_table: &str) -> bool {
     );
     if let Err(e) = Spi::run(&update_sql) {
         pgrx::warning!("Failed to update recycled_name: {}", e);
+        let _ = Spi::run(&format!("DELETE FROM flashback.operations WHERE op_id = {}", op_id));
         return false;
+    }
+
+    // CASCADE: table is now safely in flashback_recycle with metadata saved.
+    // Explicitly drop each dependent view/mview so they are no longer queryable
+    // (they would otherwise survive by OID reference — Bug I fix).
+    // Their definitions are in metadata["views"] and will be recreated on restore.
+    if cascade {
+        for view in &dep_views_to_drop {
+            let vs = view.get("schema").and_then(|s| s.as_str()).unwrap_or("public");
+            let vn = view.get("name").and_then(|s| s.as_str()).unwrap_or("");
+            let vk = view.get("kind").and_then(|s| s.as_str()).unwrap_or("v");
+            if vn.is_empty() { continue; }
+            let obj_type = if vk == "m" { "MATERIALIZED VIEW" } else { "VIEW" };
+            let drop_sql = format!(
+                "DROP {} IF EXISTS \"{}\".\"{}\" CASCADE /* pg_flashback_internal */",
+                obj_type,
+                vs.replace('"', "\"\""),
+                vn.replace('"', "\"\"")
+            );
+            if let Err(e) = Spi::run(&drop_sql) {
+                pgrx::warning!("pg_flashback: failed to drop view '{}.{}': {}", vs, vn, e);
+            }
+        }
     }
 
     true
@@ -271,13 +327,15 @@ fn capture_drop_inner(schema: &str, bare_table: &str) -> bool {
 
 // Deletes the oldest table in the recycle bin (both the physical table and the operations record)
 fn evict_oldest() {
-    let find_sql = "SELECT recycled_name FROM flashback.operations WHERE restored = false ORDER BY retention_until ASC LIMIT 1";
+    acquire_flashback_bin_lock();
+
+    let find_sql = "SELECT recycled_name FROM flashback.operations WHERE restored = false ORDER BY retention_until ASC, op_id ASC LIMIT 1";
 
     let oldest = Spi::get_one::<String>(find_sql);
 
     match oldest {
         Ok(Some(recycled_name)) => {
-            let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{}", recycled_name);
+            let drop_sql = format!("/* PG_FLASHBACK_INTERNAL */ DROP TABLE IF EXISTS flashback_recycle.{}", qi(&recycled_name));
             let delete_sql = format!("DELETE FROM flashback.operations WHERE recycled_name = '{}' AND restored = false", recycled_name);
 
             if let Err(e) = Spi::run(&drop_sql) {
@@ -296,30 +354,42 @@ fn evict_oldest() {
     }
 }
 
-// If table count exceeds max_tables, delete the oldest
+// If table count exceeds max_tables, delete the oldest (loop until under limit)
 fn enforce_table_limit() {
     let count_sql = "SELECT COUNT(*)::int FROM flashback.operations WHERE restored = false";
-
-    if let Ok(Some(count)) = Spi::get_one::<i32>(count_sql) {
-        let max = guc::get_max_tables();
-        if count >= max {
-            pgrx::log!("Table limit reached ({}/{}), removing oldest", count, max);
-            evict_oldest();
+    loop {
+        if let Ok(Some(count)) = Spi::get_one::<i32>(count_sql) {
+            let max = guc::get_max_tables();
+            if count >= max {
+                pgrx::log!("Table limit reached ({}/{}), removing oldest", count, max);
+                evict_oldest();
+                continue;
+            }
         }
+        break;
     }
 }
 
-// If total size exceeds max_size, delete the oldest (comparison in MB)
+// If total size exceeds max_size, delete the oldest (loop until under limit, comparison in MB)
 fn enforce_size_limit() {
-    let size_sql = "SELECT COALESCE(SUM(pg_total_relation_size(quote_ident('flashback_recycle') || '.' || quote_ident(recycled_name))), 0)::bigint FROM flashback.operations WHERE restored = false";
+    acquire_flashback_bin_lock();
 
-    if let Ok(Some(total_bytes)) = Spi::get_one::<i64>(size_sql) {
-        let total_mb = total_bytes / (1024 * 1024);
-        let max_mb = guc::get_max_size() as i64;
-        if total_mb >= max_mb {
-            pgrx::log!("Size limit reached ({}/{} MB), removing oldest", total_mb, max_mb);
-            evict_oldest();
+    let size_sql = "SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0)::bigint \
+                    FROM flashback.operations o \
+                    JOIN LATERAL to_regclass(format('flashback_recycle.%I', o.recycled_name)) AS r(oid) ON true \
+                    JOIN pg_class c ON c.oid = r.oid \
+                    WHERE o.restored = false";
+    loop {
+        if let Ok(Some(total_bytes)) = Spi::get_one::<i64>(size_sql) {
+            let total_mb = total_bytes / (1024 * 1024);
+            let max_mb = guc::get_max_size() as i64;
+            if total_mb >= max_mb {
+                pgrx::log!("Size limit reached ({}/{} MB), removing oldest", total_mb, max_mb);
+                evict_oldest();
+                continue;
+            }
         }
+        break;
     }
 }
 
@@ -344,63 +414,6 @@ fn check_capturable(schema: &str, bare_table: &str) -> Option<()> {
     Some(())
 }
 
-/// Strip double-quotes from a single SQL identifier token.
-/// e.g. `"My Schema"` → `My Schema`, `public` → `public`.
-fn strip_quotes(s: &str) -> String {
-    let s = s.trim();
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        // Unescape doubled double-quotes inside: "" → "
-        s[1..s.len() - 1].replace("\"\"", "\"")
-    } else {
-        s.to_string()
-    }
-}
-
-/// Split a potentially quoted `schema.table` or bare `table` token into (schema, table).
-/// Handles: `public.orders`, `"My NS"."My Tbl"`, `orders`, `"orders"`
-fn split_schema_table(token: &str) -> (String, String) {
-    // We need to split on the DOT that is NOT inside double-quotes.
-    let mut depth = 0usize;
-    let mut dot_pos = None;
-    for (i, ch) in token.char_indices() {
-        match ch {
-            '"' => depth = if depth == 0 { 1 } else { 0 },
-            '.' if depth == 0 => { dot_pos = Some(i); break; }
-            _ => {}
-        }
-    }
-    if let Some(pos) = dot_pos {
-        let schema = strip_quotes(&token[..pos]);
-        let table  = strip_quotes(&token[pos + 1..]);
-        (schema, table)
-    } else {
-        ("public".to_string(), strip_quotes(token))
-    }
-}
-
-/// Tokenise the table list portion of a DROP TABLE statement while respecting
-/// double-quoted identifiers (which may contain commas or spaces).
-/// Input example: `orders, "My Schema"."My Table", public.customers`
-fn tokenise_table_list(list_str: &str) -> Vec<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    for ch in list_str.chars() {
-        match ch {
-            '"' => { in_quotes = !in_quotes; current.push(ch); }
-            ',' if !in_quotes => {
-                let t = current.trim().to_string();
-                if !t.is_empty() { tokens.push(t); }
-                current = String::new();
-            }
-            _ => { current.push(ch); }
-        }
-    }
-    let t = current.trim().to_string();
-    if !t.is_empty() { tokens.push(t); }
-    tokens
-}
-
 /// Called from the ProcessUtility hook with names extracted from the DropStmt AST.
 /// Using the AST avoids mis-parsing the query string when fired inside a multi-statement batch.
 pub fn handle_drop_table(tables: &[(String, String)], if_exists: bool, cascade: bool) -> bool {
@@ -416,22 +429,49 @@ pub fn handle_drop_table(tables: &[(String, String)], if_exists: bool, cascade: 
     let mut any_seen = false;
     let mut skipped_drops: Vec<String> = Vec::new();
 
-    for (schema, bare_table) in tables {
+    for (schema_in, bare_table) in tables {
+        let mut schema = schema_in.clone();
 
         // Quick existence + kind check so we know whether to pass to PG or absorb.
-        let row_info = Spi::get_one::<String>(&format!(
-            "SELECT relpersistence::text || ':' || relkind::text || ':' || relispartition::text \
-             FROM pg_class \
-             WHERE relname = '{}' \
-               AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '{}' LIMIT 1) \
-             LIMIT 1",
-            bare_table, schema
-        ))
-        .unwrap_or(None)
-        .unwrap_or_default();
+        let row_info = if schema.is_empty() {
+            let visible = Spi::get_one::<String>(&format!(
+                "SELECT n.nspname || chr(1) || c.relpersistence::text || ':' || c.relkind::text || ':' || c.relispartition::text \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relname = '{}' AND pg_table_is_visible(c.oid) \
+                 ORDER BY c.oid DESC \
+                 LIMIT 1",
+                bare_table
+            ))
+            .unwrap_or(None)
+            .unwrap_or_default();
+
+            if let Some((resolved_schema, info)) = visible.split_once('\x01') {
+                schema = resolved_schema.to_string();
+                info.to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            Spi::get_one::<String>(&format!(
+                "SELECT relpersistence::text || ':' || relkind::text || ':' || relispartition::text \
+                 FROM pg_class \
+                 WHERE relname = '{}' \
+                   AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '{}' LIMIT 1) \
+                 LIMIT 1",
+                bare_table, schema
+            ))
+            .unwrap_or(None)
+            .unwrap_or_default()
+        };
 
         if row_info.is_empty() {
-            // Non-existent table — IF EXISTS no-op, just skip.
+            if !if_exists {
+                // No IF EXISTS and table doesn't exist — raise a PostgreSQL-compatible error.
+                // Any SPI work already done this call will roll back with the transaction.
+                pgrx::error!("table \"{}\" does not exist", bare_table);
+            }
+            // IF EXISTS no-op, just skip.
             continue;
         }
         any_seen = true;
@@ -447,9 +487,7 @@ pub fn handle_drop_table(tables: &[(String, String)], if_exists: bool, cascade: 
             // We'll issue a direct DROP for this table ourselves so PG doesn't error.
             let if_e  = if if_exists { "IF EXISTS " } else { "" };
             let casc  = if cascade   { " CASCADE"  } else { "" };
-            // The /* pg_flashback_internal */ comment causes hooks.rs to skip this statement,
-            // preventing a re-entrant infinite loop.
-            // Quote identifiers so names with special chars are handled correctly.
+            // pg_flashback_internal marker prevents the hook from re-intercepting this DROP.
             skipped_drops.push(format!(
                 "DROP TABLE {}\"{}\".\"{}\"{} /* pg_flashback_internal */",
                 if_e,
@@ -458,22 +496,30 @@ pub fn handle_drop_table(tables: &[(String, String)], if_exists: bool, cascade: 
                 casc
             ));
         } else {
-            // Capturable — move it to flashback_recycle.
-            capture_drop_inner(&schema, &bare_table);
+            let captured = capture_drop_inner(&schema, &bare_table, cascade);
+            if !captured {
+                // capture_drop_inner declined (views exist but no CASCADE).
+                // Let PostgreSQL handle this DROP natively so it fires the correct error.
+                let if_e = if if_exists { "IF EXISTS " } else { "" };
+                let casc = if cascade   { " CASCADE"  } else { "" };
+                skipped_drops.push(format!(
+                    "DROP TABLE {}\"{}\".\"{}\"{} /* pg_flashback_internal */",
+                    if_e,
+                    schema.replace('"', "\"\""),
+                    bare_table.replace('"', "\"\""),
+                    casc
+                ));
+            }
         }
     }
 
-    // Execute individual drops for tables we couldn't capture.
     for drop_sql in &skipped_drops {
         if let Err(e) = Spi::run(drop_sql) {
             pgrx::warning!("pg_flashback: fallback DROP failed: {}", e);
         }
     }
 
-    // Return true (absorb the original DROP command) if we saw at least one table.
-    // We've already handled everything — either moved to flashback_recycle or explicitly dropped.
-    // Returning false would cause PG to run the original DROP again, which would error because
-    // the tables are already gone.
+    // true = absorb the original DROP; we've already handled every table.
     any_seen
 }
 
@@ -486,8 +532,12 @@ fn capture_single_truncate(schema: &str, bare_table: &str) {
     // Reserve a unique op_id first; use it as the recycled_name suffix to guarantee uniqueness.
     let reserve_sql = format!(
         "INSERT INTO flashback.operations \
-         (operation_type, schema_name, table_name, recycled_name, role_name, retention_until) \
-         VALUES ('TRUNCATE', '{}', '{}', '', current_user, now() + interval '{} days') \
+         (operation_type, schema_name, table_name, recycled_name, role_name, retention_until, \
+          query_text, application_name, client_addr) \
+         VALUES ('TRUNCATE', '{}', '{}', '', current_user, now() + interval '{} days', \
+          COALESCE(current_query(), ''), \
+          COALESCE(current_setting('application_name', true), ''), \
+          COALESCE(inet_client_addr()::text, '')) \
          RETURNING op_id",
         schema, bare_table, guc::get_retention_days()
     );
@@ -499,7 +549,7 @@ fn capture_single_truncate(schema: &str, bare_table: &str) {
         }
     };
 
-    let recycled_name = format!("{}_{}", bare_table, op_id);
+    let recycled_name = with_suffix_63(bare_table, &format!("_{}", op_id));
 
     // Collect sequence info for all serial columns
     let seq_info = {
@@ -534,12 +584,12 @@ fn capture_single_truncate(schema: &str, bare_table: &str) {
         });
         serde_json::Value::Object(map)
     };
-    let metadata_json = seq_info.to_string();
+    let metadata_json = seq_info.to_string().replace('\'', "''");
 
     // Copy data into a new backup table in flashback_recycle schema
     let create_sql = format!(
         "CREATE TABLE flashback_recycle.{} AS SELECT * FROM {}.{}",
-        recycled_name, schema, bare_table
+        qi(&recycled_name), qi(schema), qi(bare_table)
     );
     if let Err(e) = Spi::run(&create_sql) {
         pgrx::warning!("TRUNCATE backup error: {}", e);
@@ -552,6 +602,7 @@ fn capture_single_truncate(schema: &str, bare_table: &str) {
         recycled_name, metadata_json, op_id
     )) {
         pgrx::warning!("TRUNCATE metadata update error: {}", e);
+        let _ = Spi::run(&format!("DELETE FROM flashback.operations WHERE op_id = {}", op_id));
         return;
     }
 
@@ -559,10 +610,10 @@ fn capture_single_truncate(schema: &str, bare_table: &str) {
 }
 
 /// Called from the ProcessUtility hook with names extracted from the TruncateStmt AST.
-pub fn handle_truncate_table(tables: &[(String, String)]) -> bool {
+pub fn handle_truncate_table(tables: &[(String, String)]) {
     // Skip silently if the extension is not yet installed
     if Spi::get_one::<bool>("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'flashback')").unwrap_or(None) != Some(true) {
-        return false;
+        return;
     }
 
     for (schema, bare_table) in tables {
@@ -603,32 +654,18 @@ pub fn handle_truncate_table(tables: &[(String, String)]) -> bool {
 
         capture_single_truncate(schema, bare_table);
     }
-
-    false  // false = let PostgreSQL execute the actual TRUNCATE
 }
 
 /// Called when DROP SCHEMA [IF EXISTS] ... CASCADE is intercepted.
+/// `schema_name` is extracted from the DropStmt AST by the caller.
 /// Best-effort: capture all regular tables in the schema before they are removed.
-pub fn handle_drop_schema_cascade(query: &str) {
+pub fn handle_drop_schema_cascade(schema_name: &str) {
     if Spi::get_one::<bool>("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'flashback')")
         .unwrap_or(None) != Some(true)
     {
         return;
     }
-
-    // Parse schema name: DROP SCHEMA [IF EXISTS] schema_name [CASCADE|RESTRICT]
-    let schema_name = query
-        .trim()
-        .trim_end_matches(';')
-        .split_whitespace()
-        .filter(|w| {
-            let u = w.to_uppercase();
-            u != "DROP" && u != "SCHEMA" && u != "IF" && u != "EXISTS"
-                && u != "CASCADE" && u != "RESTRICT"
-        })
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let schema_name = schema_name.to_string();
 
     if schema_name.is_empty()
         || schema_name == "flashback"
@@ -648,8 +685,10 @@ pub fn handle_drop_schema_cascade(query: &str) {
 
     // Enumerate all regular (non-partition-child) tables in the schema.
     // Use Spi::get_one+string_agg to avoid Spi::connect inside a hook context.
+    // chr(1) (SOH) separator: PG identifiers cannot contain SOH bytes, safe even for
+    // quoted names that include commas (e.g. "a,b").
     let tables_csv = Spi::get_one::<String>(&format!(
-        "SELECT COALESCE(string_agg(relname, ',' ORDER BY relname), '') \
+        "SELECT COALESCE(string_agg(relname, chr(1) ORDER BY relname), '') \
          FROM pg_class \
          WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '{}') \
            AND relkind = 'r' AND NOT relispartition",
@@ -661,7 +700,7 @@ pub fn handle_drop_schema_cascade(query: &str) {
     let tables: Vec<String> = if tables_csv.is_empty() {
         Vec::new()
     } else {
-        tables_csv.split(',').map(String::from).collect()
+        tables_csv.split('\x01').map(String::from).collect()
     };
 
     if tables.is_empty() {
@@ -670,7 +709,7 @@ pub fn handle_drop_schema_cascade(query: &str) {
 
     let mut captured = 0i32;
     for table in &tables {
-        if capture_drop_inner(&schema_name, table) {
+        if capture_drop_inner(&schema_name, table, true) {
             captured += 1;
         }
     }

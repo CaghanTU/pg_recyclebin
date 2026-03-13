@@ -1,1 +1,3 @@
 /target
+manual_tests.sql
+stress_test.sh

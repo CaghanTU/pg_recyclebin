@@ -1010,4 +1010,123 @@ mod tests {
         Spi::run("DROP SCHEMA IF EXISTS test_bulk_schema CASCADE").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
     }
+
+    // Test 31: DROP TABLE existing, non_existent (without IF EXISTS) should error
+    #[pg_test]
+    #[should_panic]
+    fn test_drop_nonexistent_table_errors() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_drop_real CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_drop_real (id int)").unwrap();
+
+        // This should raise an error because non_existent_xyz does not exist
+        // and no IF EXISTS is specified. Bug 1 fix: pgrx::error! is called.
+        Spi::run("DROP TABLE test_drop_real, non_existent_xyz_table").unwrap();
+    }
+
+    // Test 32: DROP TABLE existing, non_existent WITH IF EXISTS should succeed silently
+    #[pg_test]
+    fn test_drop_nonexistent_with_if_exists_ok() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_drop_ifexists CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_drop_ifexists (id int)").unwrap();
+
+        // IF EXISTS: non-existent table should be silently skipped, real table captured.
+        Spi::run("DROP TABLE IF EXISTS test_drop_ifexists, non_existent_xyz_table").unwrap();
+
+        let count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations \
+             WHERE table_name = 'test_drop_ifexists' AND restored = false"
+        ).unwrap().unwrap_or(0);
+        assert_eq!(count, 1, "Real table should be in recycle bin");
+
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+    }
+
+    // Test 33: View with special-character name restores correctly (Bug 2 fix)
+    #[pg_test]
+    fn test_view_special_name_restore() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_view_base CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_view_base (id int, val text)").unwrap();
+        Spi::run("INSERT INTO test_view_base VALUES (1, 'hello')").unwrap();
+        // View name with uppercase (requires quoting to round-trip correctly)
+        Spi::run("CREATE VIEW \"MySpecialView\" AS SELECT * FROM test_view_base").unwrap();
+
+        Spi::run("DROP TABLE test_view_base CASCADE").unwrap();
+
+        let restored = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_view_base', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(restored, "Table with dependent view should restore");
+
+        // View should be recreated
+        let view_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_views WHERE viewname = 'MySpecialView')"
+        ).unwrap().unwrap_or(false);
+        assert!(view_exists, "Special-named view should be recreated after restore");
+
+        Spi::run("DROP TABLE IF EXISTS test_view_base CASCADE").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+    }
+
+    // Test 34: flashback_purge_all returns actual purged count (Bug 4 fix)
+    #[pg_test]
+    fn test_purge_all_count() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_purge_a, test_purge_b CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_purge_a (id int)").unwrap();
+        Spi::run("CREATE TABLE test_purge_b (id int)").unwrap();
+        Spi::run("DROP TABLE test_purge_a").unwrap();
+        Spi::run("DROP TABLE test_purge_b").unwrap();
+
+        let count = Spi::get_one::<i64>(
+            "SELECT flashback_purge_all()"
+        ).unwrap().unwrap_or(-1);
+        assert_eq!(count, 2, "purge_all should return 2 (the number of successfully purged entries)");
+
+        // Recycle bin should be empty now
+        let remaining = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM flashback.operations WHERE restored = false"
+        ).unwrap().unwrap_or(-1);
+        assert_eq!(remaining, 0, "Recycle bin should be empty after purge_all");
+    }
+
+    // Test 35: Restore with savepoint safety — second restore of same table fails gracefully (Bug 5)
+    #[pg_test]
+    fn test_restore_duplicate_name_fails_gracefully() {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+        Spi::run("DROP TABLE IF EXISTS test_savepoint_tbl CASCADE").unwrap();
+        Spi::run("CREATE TABLE test_savepoint_tbl (id int)").unwrap();
+        Spi::run("DROP TABLE test_savepoint_tbl").unwrap();
+
+        // Restore once — should succeed
+        let first = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_savepoint_tbl', NULL)"
+        ).unwrap().unwrap_or(false);
+        assert!(first, "First restore should succeed");
+
+        // Drop again so we have a second bin entry
+        Spi::run("DROP TABLE test_savepoint_tbl").unwrap();
+        Spi::run("CREATE TABLE test_savepoint_tbl (id int)").unwrap();
+
+        // Table now exists AND a bin entry exists — restore should fail gracefully
+        let second = Spi::get_one::<bool>(
+            "SELECT flashback_restore('test_savepoint_tbl', NULL)"
+        ).unwrap().unwrap_or(true);
+        assert!(!second, "Restore should fail gracefully when target table already exists");
+
+        // The existing table must still be intact (not orphaned)
+        let exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_tables WHERE tablename = 'test_savepoint_tbl')"
+        ).unwrap().unwrap_or(false);
+        assert!(exists, "Existing table must not be lost after failed restore");
+
+        Spi::run("DROP TABLE IF EXISTS test_savepoint_tbl CASCADE").unwrap();
+        Spi::run("SELECT flashback_purge_all()").unwrap();
+    }
 }

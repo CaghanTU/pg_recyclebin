@@ -15,7 +15,11 @@ path = "src/bin/pgrx_embed_pg_flashback.rs"
 
 [features]
 default = []
+pg14 = ["pgrx/pg14"]
+pg15 = ["pgrx/pg15"]
+pg16 = ["pgrx/pg16"]
 pg17 = ["pgrx/pg17"]
+pg18 = ["pgrx/pg18"]
 pg_test = []
 
 [dependencies]

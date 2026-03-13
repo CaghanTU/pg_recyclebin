@@ -19,7 +19,8 @@ pub extern "C-unwind" fn flashback_cleanup_worker_main(_arg: pg_sys::Datum) {
     
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
+    let dbname = crate::guc::get_database_name();
+    BackgroundWorker::connect_worker_to_spi(Some(dbname.as_str()), None);
 
     pgrx::log!("Flashback Auto-Cleanup Worker started");
     
@@ -45,6 +46,30 @@ fn cleanup_expired_tables() {
     }
 
     let result: Result<(), spi::Error> = Spi::connect(|client| {
+        // Skip if extension is not installed in this database.
+        // Check for the operations TABLE specifically (not just the schema), because
+        // DROP EXTENSION drops the table but may leave the schema behind if the schema
+        // was created before the extension was first installed.  Checking only the schema
+        // would let the worker proceed and crash on "relation does not exist".
+        let schema_exists = client
+            .select(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM pg_class c \
+                    JOIN pg_namespace n ON n.oid = c.relnamespace \
+                    WHERE n.nspname = 'flashback' \
+                      AND c.relname = 'operations' \
+                      AND c.relkind = 'r')",
+                None,
+                &[] as &[pgrx::datum::DatumWithOid],
+            )?
+            .first()
+            .get::<bool>(1)?
+            .unwrap_or(false);
+
+        if !schema_exists {
+            return Ok(());
+        }
+
         let query = "SELECT op_id, recycled_name, table_name \
              FROM flashback.operations \
              WHERE restored = false \
@@ -64,7 +89,7 @@ fn cleanup_expired_tables() {
                 continue;
             }
 
-            let drop_sql = format!("DROP TABLE IF EXISTS flashback_recycle.{} CASCADE", recycled_name);
+            let drop_sql = format!("/* PG_FLASHBACK_INTERNAL */ DROP TABLE IF EXISTS flashback_recycle.{} CASCADE", crate::context::qi(&recycled_name));
             
             if let Err(e) = Spi::run(&drop_sql) {
                 pgrx::warning!("Failed to drop expired table '{}': {}", recycled_name, e);

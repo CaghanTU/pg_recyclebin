@@ -25,14 +25,18 @@ CREATE TABLE IF NOT EXISTS flashback.operations (
 );
 CREATE INDEX IF NOT EXISTS idx_flashback_ops_table ON flashback.operations (table_name, timestamp);
 CREATE INDEX IF NOT EXISTS idx_flashback_ops_retention ON flashback.operations (retention_until);
--- Explicit permission hardening: block PUBLIC access to internal schemas/tables.
--- PostgreSQL defaults don't grant PUBLIC access to non-public schemas, but we
--- make this explicit so the intent is clear and survives pg_dump/restore cycles.
-REVOKE ALL ON SCHEMA flashback FROM PUBLIC;
-REVOKE ALL ON SCHEMA flashback_recycle FROM PUBLIC;
-REVOKE ALL ON ALL TABLES IN SCHEMA flashback FROM PUBLIC;
-ALTER DEFAULT PRIVILEGES IN SCHEMA flashback REVOKE ALL ON TABLES FROM PUBLIC;
-ALTER DEFAULT PRIVILEGES IN SCHEMA flashback_recycle REVOKE ALL ON TABLES FROM PUBLIC;
+-- The ProcessUtility hook runs as the calling user; grant the minimum set of
+-- privileges so that non-superusers can also DROP / TRUNCATE tracked tables
+-- and call flashback_restore*() functions.
+-- Row Level Security restricts each user to their own operations,
+-- while superusers bypass RLS by default (no FORCE needed).
+GRANT USAGE ON SCHEMA flashback TO PUBLIC;
+GRANT INSERT, SELECT, UPDATE ON flashback.operations TO PUBLIC;
+GRANT USAGE ON SEQUENCE flashback.operations_op_id_seq TO PUBLIC;
+GRANT USAGE, CREATE ON SCHEMA flashback_recycle TO PUBLIC;
+ALTER TABLE flashback.operations ENABLE ROW LEVEL SECURITY;
+CREATE POLICY flashback_ops_own_rows ON flashback.operations
+    USING (role_name = current_user);
 "#,
     name = "flashback_schema_setup",
     bootstrap
@@ -43,6 +47,7 @@ mod ddl_capture;
 mod recovery;
 mod background_worker;
 pub mod guc;
+pub(crate) mod context;
 mod tests;
 
 #[pg_guard]

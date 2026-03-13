@@ -7,6 +7,7 @@ static MAX_TABLES: GucSetting<i32> = GucSetting::<i32>::new(100);
 static MAX_SIZE: GucSetting<i32> = GucSetting::<i32>::new(102400);
 static WORKER_INTERVAL_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(60);
 static EXCLUDED_SCHEMAS: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+static DATABASE_NAME: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 pub fn register_gucs() {
     GucRegistry::define_int_guc(
@@ -61,6 +62,15 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_string_guc(
+        c"flashback.database_name",
+        c"Database that the flashback cleanup background worker will connect to",
+        c"Set this to the name of the database where pg_flashback is installed. Defaults to 'postgres'.",
+        &DATABASE_NAME,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 pub fn get_retention_days() -> i32 {
@@ -89,4 +99,14 @@ pub fn get_excluded_schemas() -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+pub fn get_database_name() -> String {
+    DATABASE_NAME
+        .get()
+        .as_ref()
+        .and_then(|s| s.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "postgres".to_string())
 }

@@ -3,6 +3,24 @@ use std::ffi::CStr;
 
 static mut PREV_PROCESS_UTILITY: pg_sys::ProcessUtility_hook_type = None;
 
+/// Extract the C string pointer from a PostgreSQL String/Value node.
+/// PG14 uses `pg_sys::Value` with `val.str_`; PG15+ uses `pg_sys::String` with `sval`.
+unsafe fn pg_node_str(ptr: *mut std::ffi::c_void) -> *const std::os::raw::c_char {
+    if ptr.is_null() {
+        return std::ptr::null();
+    }
+    #[cfg(feature = "pg14")]
+    {
+        let val = ptr as *mut pg_sys::Value;
+        (*val).val.str_
+    }
+    #[cfg(not(feature = "pg14"))]
+    {
+        let s = ptr as *mut pg_sys::String;
+        (*s).sval
+    }
+}
+
 pub fn install() {
     unsafe {
         PREV_PROCESS_UTILITY = pg_sys::ProcessUtility_hook;
@@ -29,10 +47,6 @@ fn cstr_to_string(ptr: *const std::os::raw::c_char) -> Option<String> {
     }
 }
 
-/// Extract (schema, table) pairs, if_exists, and cascade from a DROP TABLE AST.
-/// DropStmt.objects is a List<List<pg_sys::String>> — each element is a qualified name
-/// stored as a list of string nodes ([schema, table] or just [table]).
-/// This is NOT a List<RangeVar>; that format is used by TruncateStmt.relations.
 unsafe fn drop_table_ast_names(
     pstmt: *mut pg_sys::PlannedStmt,
 ) -> (Vec<(String, String)>, bool, bool) {
@@ -67,15 +81,15 @@ unsafe fn drop_table_ast_names(
         if inner_elements.is_null() || n_inner == 0 {
             continue;
         }
-        // Collect the name parts (each is a pg_sys::String node)
+        // Collect the name parts (each is a String/Value node)
         let mut parts: Vec<String> = Vec::new();
         for j in 0..n_inner {
             let inner_cell = &*inner_elements.add(j);
-            let str_node = inner_cell.ptr_value as *mut pg_sys::String;
-            if str_node.is_null() || (*str_node).sval.is_null() {
+            let sval = pg_node_str(inner_cell.ptr_value as *mut std::ffi::c_void);
+            if sval.is_null() {
                 continue;
             }
-            let s = CStr::from_ptr((*str_node).sval)
+            let s = CStr::from_ptr(sval)
                 .to_str()
                 .unwrap_or("")
                 .to_string();
@@ -84,7 +98,9 @@ unsafe fn drop_table_ast_names(
             }
         }
         let (schema, table) = match parts.len() {
-            1 => ("public".to_string(), parts.remove(0)),
+            // Unqualified name: resolve via search_path in ddl_capture.
+            // Do not force "public" here, otherwise TEMP tables are mis-resolved.
+            1 => ("".to_string(), parts.remove(0)),
             n if n >= 2 => {
                 let table = parts.remove(n - 1);
                 let schema = parts.remove(n - 2);
@@ -97,6 +113,23 @@ unsafe fn drop_table_ast_names(
         }
     }
     (tables, if_exists, cascade)
+}
+
+/// Extract the schema name from a DROP SCHEMA AST.
+/// DropStmt.objects for OBJECT_SCHEMA is List<StringNode> (not List<List<StringNode>>).
+unsafe fn drop_schema_ast_name(pstmt: *mut pg_sys::PlannedStmt) -> String {
+    if pstmt.is_null() { return String::new(); }
+    let drop = (*pstmt).utilityStmt as *mut pg_sys::DropStmt;
+    if drop.is_null() { return String::new(); }
+    let objects = (*drop).objects;
+    if objects.is_null() || (*objects).length == 0 { return String::new(); }
+    let cell = &*(*objects).elements.add(0);
+    let sval = pg_node_str(cell.ptr_value as *mut std::ffi::c_void);
+    if sval.is_null() { return String::new(); }
+    CStr::from_ptr(sval)
+        .to_str()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Extract (schema, table) pairs from a TRUNCATE statement AST.
@@ -155,7 +188,6 @@ unsafe extern "C-unwind" fn process_utility_hook(
     qc: *mut pg_sys::QueryCompletion,
 ) {
 
-   // Only intercept DROP TABLE commands (checked via AST node type)
     let is_drop_table = unsafe {
         if pstmt.is_null() {
             false
@@ -189,7 +221,6 @@ unsafe extern "C-unwind" fn process_utility_hook(
         }
     };
 
-    // Detect DROP SCHEMA so we can capture tables before the schema is deleted.
     let is_drop_schema = unsafe {
         if pstmt.is_null() {
             false
@@ -210,15 +241,13 @@ unsafe extern "C-unwind" fn process_utility_hook(
     };
 
     if is_drop_table {
-        // is_internal check uses query_string; names are read from the AST so that
-        // multi-statement batches (where query_string contains the full batch) work correctly.
+        // Skip our own internal DDL to prevent re-entrant interception.
+        // Only check for the PG_FLASHBACK_INTERNAL marker that we explicitly inject into
+        // internally-generated SQL. Broad schema-name checks (FLASHBACK_RECYCLE,
+        // FLASHBACK.OPERATIONS) caused false positives when user query batches happened to
+        // reference those schemas elsewhere in the same multi-statement string.
         let is_internal = cstr_to_string(query_string)
-            .map(|q| {
-                let u = q.to_uppercase();
-                u.contains("FLASHBACK_RECYCLE")
-                    || u.contains("FLASHBACK.OPERATIONS")
-                    || u.contains("PG_FLASHBACK_INTERNAL")
-            })
+            .map(|q| q.to_uppercase().contains("PG_FLASHBACK_INTERNAL"))
             .unwrap_or(false);
         if !is_internal {
             let (tables, if_exists, cascade) = drop_table_ast_names(pstmt);
@@ -230,10 +259,7 @@ unsafe extern "C-unwind" fn process_utility_hook(
 
     if is_truncate {
         let is_internal = cstr_to_string(query_string)
-            .map(|q| {
-                let u = q.to_uppercase();
-                u.contains("FLASHBACK_RECYCLE") || u.contains("FLASHBACK.OPERATIONS")
-            })
+            .map(|q| q.to_uppercase().contains("PG_FLASHBACK_INTERNAL"))
             .unwrap_or(false);
         if !is_internal {
             let tables = truncate_ast_names(pstmt);
@@ -243,12 +269,19 @@ unsafe extern "C-unwind" fn process_utility_hook(
 
     // Capture tables from DROP SCHEMA CASCADE before the schema is removed.
     // We do this BEFORE delegating to standard_ProcessUtility so the tables still exist.
+    // Schema name is read from the AST (DropStmt.objects is List<StringNode> for OBJECT_SCHEMA).
+    // Only intercept CASCADE drops: a RESTRICT drop on a non-empty schema must still fail.
     if is_drop_schema {
-        if let Some(query) = cstr_to_string(query_string) {
-            let upper = query.to_uppercase();
-            if !upper.contains("FLASHBACK") {
-                crate::ddl_capture::handle_drop_schema_cascade(&query);
-            }
+        let schema_name = drop_schema_ast_name(pstmt);
+        let is_cascade = unsafe {
+            let drop = (*pstmt).utilityStmt as *mut pg_sys::DropStmt;
+            (*drop).behavior == pg_sys::DropBehavior::DROP_CASCADE
+        };
+        if !schema_name.is_empty()
+            && !schema_name.to_uppercase().contains("FLASHBACK")
+            && is_cascade
+        {
+            crate::ddl_capture::handle_drop_schema_cascade(&schema_name);
         }
     }
     
