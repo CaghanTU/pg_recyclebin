@@ -328,8 +328,9 @@ pg_flashback creates two schemas on install:
 
 - `flashback_purge` removes only the most recently dropped version; use `flashback_purge_by_id` to remove a specific version.
 - **TRUNCATE on large tables**: the backup is a full data copy (`CREATE TABLE ... AS SELECT *`). On very large tables this will consume additional disk space equal to the original table size and may take noticeable time. For tables in that size range consider excluding the schema via `flashback.excluded_schemas`.
+- **TRUNCATE restore constraints**: restoring a TRUNCATE entry requires the target table to still exist, and it fails if the table is currently referenced by incoming foreign keys from other tables.
 - When a partitioned table's child partitions are missing after restore (edge case: child was in a different schema that was also dropped), pg_flashback recreates the partition shell but the original data is gone — a `WARNING` is emitted.
-- Materialized views dependent on a dropped table are dropped along with it (on `CASCADE`) and **recreated** on restore — same as regular views.
+- Materialized views dependent on a dropped table are dropped along with it (on `CASCADE`) and recreated from captured definitions on restore. Mview-specific runtime state (for example last refresh timing/history) is not preserved.
 
 ---
 
