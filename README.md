@@ -6,6 +6,31 @@ A PostgreSQL extension that adds a **recycle bin** for dropped tables. Instead o
 
 ---
 
+## 🔥 Quick Start
+
+```sql
+-- Enable extension
+CREATE EXTENSION pg_flashback;
+
+-- Create test table
+CREATE TABLE test (id int);
+INSERT INTO test VALUES (1), (2);
+
+-- Drop it
+DROP TABLE test;
+
+-- See recycle bin
+SELECT * FROM flashback_list_recycled_tables();
+
+-- Restore it
+SELECT flashback_restore('test');
+
+-- Verify
+SELECT * FROM test;
+```
+
+---
+
 ## Features
 
 - Automatically captures `DROP TABLE` (including multi-table `DROP TABLE t1, t2`), `DROP TABLE ... CASCADE`, and `TRUNCATE TABLE`
@@ -52,13 +77,23 @@ A PostgreSQL extension that adds a **recycle bin** for dropped tables. Instead o
 ```bash
 git clone https://github.com/CaghanTU/pg_flashback.git
 cd pg_flashback
-./install.sh
+./install.sh  # builds with pgrx and installs to PostgreSQL
+
+# Alternative (manual/pro)
+cargo pgrx install --release
 ```
 
 ### First-time setup checklist
 
-1. PostgreSQL is running with `shared_preload_libraries = 'pg_flashback'`.
-2. PostgreSQL is restarted after changing `shared_preload_libraries`.
+1. Set `shared_preload_libraries` in `postgresql.conf`:
+
+```conf
+shared_preload_libraries = 'pg_flashback'
+```
+
+Requires restart.
+
+2. Restart PostgreSQL.
 3. Extension is created in the target database:
 
 ```sql
@@ -70,16 +105,6 @@ CREATE EXTENSION pg_flashback;
 ```sql
 ALTER SYSTEM SET flashback.database_name = 'your_database_name';
 SELECT pg_reload_conf();
-```
-
-Then load the extension in PostgreSQL:
-
-```sql
--- postgresql.conf (add this line):
-shared_preload_libraries = 'pg_flashback'
-
--- After restarting PostgreSQL:
-CREATE EXTENSION pg_flashback;
 ```
 
 ---
