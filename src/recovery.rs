@@ -642,6 +642,10 @@ fn flashback_restore(table_name: &str, target_schema: default!(Option<&str>, NUL
         let op_id_val = match op_id_val {
             Some(id) => id,
             None => {
+                // Phase 4.3 fallback: try pgBackRest backup restore if stanza is configured
+                if try_backup_restore_fallback(table_name, target_schema) {
+                    return true;
+                }
                 pgrx::warning!("Table not found in recycle bin: {}", table_name);
                 return false;
             }
@@ -679,6 +683,73 @@ fn flashback_restore(table_name: &str, target_schema: default!(Option<&str>, NUL
     };
 
     perform_restore(&recycled_name, table_name, &schema_name, &role_name, &operation_type, &metadata_json, target_schema)
+}
+
+/// Fallback path: attempt backup restore when a table is NOT in the recycle bin but
+/// `flashback.pgbackrest_stanza` is configured and the operation record has relfilenode metadata.
+fn try_backup_restore_fallback(table_name: &str, target_schema: Option<&str>) -> bool {
+    // Check if pgBackRest integration is configured
+    if crate::guc::get_pgbackrest_stanza().is_none() {
+        return false;
+    }
+
+    // Look for a (possibly already-restored or old) operation record that has relfilenode
+    let row = pgrx::Spi::connect(|client| {
+        let rows = client.select(
+            &format!(
+                "SELECT schema_name, COALESCE(metadata::text, '') \
+                 FROM flashback.operations \
+                 WHERE table_name = '{}' \
+                   AND metadata->>'relfilenode' IS NOT NULL \
+                 ORDER BY timestamp DESC, op_id DESC LIMIT 1",
+                table_name.replace('\'', "''")
+            ),
+            None,
+            &[],
+        )?;
+        let mut found: Option<(String, String)> = None;
+        for r in rows {
+            let s = r.get::<String>(1)?.unwrap_or_default();
+            let m = r.get::<String>(2)?.unwrap_or_default();
+            found = Some((s, m));
+        }
+        Ok::<_, pgrx::spi::Error>(found)
+    });
+
+    match row {
+        Ok(Some((schema, meta))) if !meta.is_empty() => {
+            let restore_schema = target_schema.unwrap_or(&schema);
+            pgrx::warning!(
+                "pg_flashback: '{}' not in recycle bin — attempting pgBackRest backup restore",
+                table_name
+            );
+            match crate::backup_restore::restore_table_from_backup(
+                restore_schema,
+                table_name,
+                &meta,
+                false,
+            ) {
+                Ok(()) => {
+                    let _ = pgrx::Spi::run(&format!(
+                        "UPDATE flashback.operations \
+                         SET restored = true, restored_at = now() \
+                         WHERE table_name = '{}' AND restored = false",
+                        table_name.replace('\'', "''")
+                    ));
+                    true
+                }
+                Err(e) => {
+                    pgrx::warning!(
+                        "pg_flashback: backup restore failed for '{}': {}",
+                        table_name,
+                        e
+                    );
+                    false
+                }
+            }
+        }
+        _ => false,
+    }
 }
 
 #[pg_extern]

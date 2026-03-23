@@ -219,6 +219,29 @@ fn capture_drop_inner(schema: &str, bare_table: &str, cascade: bool) -> bool {
     let op_suffix = format!("_{}", op_id);
     let recycled_name = with_suffix_63(bare_table, &op_suffix);
 
+    // Capture backup-related metadata BEFORE SET SCHEMA — pg_relation_filepath()
+    // and relfilenode reference the original location which becomes invalid after move.
+    // Uses qualified catalog lookup (relname + nspname) instead of regclass to avoid
+    // ambiguity if another object shares the same unqualified name.
+    let backup_meta: Option<serde_json::Value> = Spi::get_one::<String>(&format!(
+        "SELECT jsonb_build_object(\
+             'relfilenode', c.relfilenode::bigint,\
+             'toast_relfilenode', c.reltoastrelid::bigint,\
+             'db_oid', d.oid::bigint,\
+             'filepath', pg_relation_filepath(c.oid),\
+             'wal_lsn', pg_current_wal_lsn()::text\
+         )::text \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         CROSS JOIN pg_database d \
+         WHERE c.relname = '{}' AND n.nspname = '{}' \
+           AND d.datname = current_database()",
+        bare_table, schema
+    ))
+    .ok()
+    .flatten()
+    .and_then(|s| serde_json::from_str(&s).ok());
+
     let move_sql   = format!("ALTER TABLE {}.{} SET SCHEMA flashback_recycle", qi(schema), qi(bare_table));
     let rename_sql = format!("ALTER TABLE flashback_recycle.{} RENAME TO {}", qi(bare_table), qi(&recycled_name));
 
@@ -286,6 +309,11 @@ fn capture_drop_inner(schema: &str, bare_table: &str, cascade: bool) -> bool {
     meta_obj.insert("rls_policies".into(), serde_json::Value::Array(rls_policies));
     if let Some(pi) = partition_info {
         meta_obj.insert("partition_info".into(), pi);
+    }
+    if let Some(serde_json::Value::Object(bm)) = backup_meta {
+        for (k, v) in bm {
+            meta_obj.insert(k, v);
+        }
     }
     let meta = serde_json::Value::Object(meta_obj);
     let meta_str = meta.to_string().replace('\'', "''");

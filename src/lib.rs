@@ -48,6 +48,7 @@ mod recovery;
 mod background_worker;
 pub mod guc;
 pub(crate) mod context;
+mod backup_restore;
 mod tests;
 
 #[pg_guard]
