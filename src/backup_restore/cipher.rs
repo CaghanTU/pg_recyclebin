@@ -9,11 +9,12 @@
 /// pgBackRest encryption format (encrypt.c):
 ///   - Magic header: "Salted__" (8 bytes)
 ///   - Salt: 8 bytes (bytes 8-15)
-///   - Cipher IV + key derived with EVP_BytesToKey (MD5, 1 iteration):
+///   - Cipher IV + key derived with EVP_BytesToKey (SHA1, 1 iteration):
 ///       key = 32 bytes (AES-256), iv = 16 bytes (AES-256-CBC)
 ///   - Ciphertext: remaining bytes after the 16-byte header
 ///
-/// This is compatible with `openssl enc -aes-256-cbc -md md5 -pass pass:...`
+/// pgBackRest uses SHA1 as the EVP_BytesToKey digest.
+/// Compatible with: `openssl enc -aes-256-cbc -md sha1 -pass pass:...`
 use openssl::symm::{decrypt, Cipher};
 
 const MAGIC: &[u8] = b"Salted__";
@@ -43,8 +44,8 @@ pub fn decrypt_file(data: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("AES-256-CBC decrypt failed: {}", e))
 }
 
-/// Derive key and IV from passphrase + salt using EVP_BytesToKey (MD5, count=1).
-/// This replicates OpenSSL's default behaviour for `openssl enc -aes-256-cbc -md md5`.
+/// Derive key and IV from passphrase + salt using EVP_BytesToKey (SHA1, count=1).
+/// pgBackRest uses SHA1, compatible with `openssl enc -aes-256-cbc -md sha1 -pass pass:...`.
 fn evp_bytes_to_key(pass: &[u8], salt: &[u8], key_len: usize, iv_len: usize) -> (Vec<u8>, Vec<u8>) {
     use openssl::hash::{hash, MessageDigest};
 
@@ -56,8 +57,8 @@ fn evp_bytes_to_key(pass: &[u8], salt: &[u8], key_len: usize, iv_len: usize) -> 
         let mut input = last_hash.clone();
         input.extend_from_slice(pass);
         input.extend_from_slice(salt);
-        last_hash = hash(MessageDigest::md5(), &input)
-            .expect("MD5 hash failed")
+        last_hash = hash(MessageDigest::sha1(), &input)
+            .expect("SHA1 hash failed")
             .to_vec();
         derived.extend_from_slice(&last_hash);
     }
@@ -77,7 +78,7 @@ mod tests {
     use super::*;
 
     /// Produce a pgBackRest-compatible AES-256-CBC encrypted blob for testing.
-    /// Equivalent to: echo -n "hello world" | openssl enc -aes-256-cbc -md md5 -pass pass:secret -S AABBCCDDEEFF0011
+    /// Equivalent to: echo -n "hello world" | openssl enc -aes-256-cbc -md sha1 -pass pass:secret -S AABBCCDDEEFF0011
     fn encrypt_for_test(plaintext: &[u8], passphrase: &str) -> Vec<u8> {
         use openssl::symm::{encrypt, Cipher};
         let salt = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11u8];

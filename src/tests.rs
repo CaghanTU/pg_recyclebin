@@ -4,7 +4,7 @@ mod tests {
     use pgrx::prelude::*;
 
     fn setup() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_orders CASCADE").unwrap();
         Spi::run("CREATE TABLE test_orders (id int, val text)").unwrap();
         Spi::run("INSERT INTO test_orders VALUES (1, 'a'), (2, 'b')").unwrap();
@@ -18,7 +18,7 @@ mod tests {
     // Test 1: Temp table should NOT enter recycle bin
     #[pg_test]
     fn test_temp_table_excluded() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("CREATE TEMP TABLE temp_test (id int)").unwrap();
         Spi::run("DROP TABLE temp_test").unwrap();
 
@@ -99,7 +99,7 @@ mod tests {
     // Test 4: TRUNCATE captured and data restored correctly
     #[pg_test]
     fn test_truncate_capture_and_restore() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_trunc CASCADE").unwrap();
         Spi::run("CREATE TABLE test_trunc (id SERIAL, val text)").unwrap();
         Spi::run("INSERT INTO test_trunc (val) VALUES ('x'), ('y'), ('z')").unwrap();
@@ -182,7 +182,7 @@ mod tests {
     // Test 7: flashback_purge_all returns correct count and clears entries
     #[pg_test]
     fn test_purge_all() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_pa1 CASCADE").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_pa2 CASCADE").unwrap();
         Spi::run("CREATE TABLE test_pa1 (id int)").unwrap();
@@ -209,7 +209,7 @@ mod tests {
     // Test 8: Restore nonexistent table returns false
     #[pg_test]
     fn test_restore_nonexistent_returns_false() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
 
         let result = Spi::get_one::<bool>(
             "SELECT flashback_restore('does_not_exist_xyz', NULL)"
@@ -264,7 +264,7 @@ mod tests {
     // Test 11: SQL injection in table name is rejected
     #[pg_test]
     fn test_sql_injection_rejected() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
 
         let result = Spi::get_one::<bool>(
             "SELECT flashback_restore('orders''; DROP TABLE flashback.operations;--', NULL)"
@@ -275,7 +275,7 @@ mod tests {
     // Test 12: Table in excluded schema is not captured
     #[pg_test]
     fn test_excluded_schema_not_captured() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("SET flashback.excluded_schemas = 'excluded_test_schema'").unwrap();
         Spi::run("CREATE SCHEMA IF NOT EXISTS excluded_test_schema").unwrap();
         Spi::run("DROP TABLE IF EXISTS excluded_test_schema.excl_tbl CASCADE").unwrap();
@@ -294,7 +294,7 @@ mod tests {
     // Test 13: flashback_status returns sensible values
     #[pg_test]
     fn test_flashback_status() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
 
         // table_limit should be > 0, retention_days > 0
         let table_limit = Spi::get_one::<i32>(
@@ -311,7 +311,7 @@ mod tests {
     // Test 14: flashback_list_recycled_tables returns correct operation_type column
     #[pg_test]
     fn test_list_returns_operation_type() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_list_drop CASCADE").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_list_trunc CASCADE").unwrap();
         Spi::run("CREATE TABLE test_list_drop (id int)").unwrap();
@@ -336,7 +336,7 @@ mod tests {
     // Test 15: GENERATED ALWAYS AS IDENTITY column — DROP restore preserves sequence
     #[pg_test]
     fn test_identity_column_drop_restore() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_identity_drop CASCADE").unwrap();
         Spi::run(
             "CREATE TABLE test_identity_drop (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, val text)"
@@ -370,7 +370,7 @@ mod tests {
     // This test also covers the OVERRIDING SYSTEM VALUE fix required for IDENTITY columns.
     #[pg_test]
     fn test_identity_column_truncate_restore() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_identity_trunc CASCADE").unwrap();
         Spi::run(
             "CREATE TABLE test_identity_trunc (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, val text)"
@@ -409,7 +409,7 @@ mod tests {
     // Test 17: Table in a non-public schema is captured and restored correctly
     #[pg_test]
     fn test_non_public_schema_restore() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("CREATE SCHEMA IF NOT EXISTS testns").unwrap();
         Spi::run("DROP TABLE IF EXISTS testns.ns_orders CASCADE").unwrap();
         Spi::run("CREATE TABLE testns.ns_orders (id int, val text)").unwrap();
@@ -442,7 +442,7 @@ mod tests {
     // Test 18: TRUNCATE on an empty table — restore must not crash and return 0 rows
     #[pg_test]
     fn test_empty_table_truncate_restore() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_empty_trunc CASCADE").unwrap();
         Spi::run("CREATE TABLE test_empty_trunc (id int, val text)").unwrap();
         // No rows — table is intentionally empty
@@ -466,7 +466,7 @@ mod tests {
     // Test 19: flashback.max_tables GUC — oldest entry is evicted when limit is reached
     #[pg_test]
     fn test_table_limit_enforcement() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         // Clean slate so residual entries from other tests don't skew the count
         Spi::run("SELECT flashback_purge_all()").unwrap();
 
@@ -495,7 +495,7 @@ mod tests {
     // Test 20: Dependent view DDL is saved and recreated on DROP restore
     #[pg_test]
     fn test_view_dependency_restored_after_drop() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_view_tbl CASCADE").unwrap();
         Spi::run("CREATE TABLE test_view_tbl (id int, status text)").unwrap();
         Spi::run("INSERT INTO test_view_tbl VALUES (1, 'active'), (2, 'inactive')").unwrap();
@@ -545,7 +545,7 @@ mod tests {
     // Test 21: DROP TABLE IF EXISTS on a non-existent table is a no-op (not captured)
     #[pg_test]
     fn test_drop_table_if_exists_nonexistent() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
 
         let count_before = Spi::get_one::<i64>(
             "SELECT COUNT(*) FROM flashback.operations WHERE table_name = 'does_not_exist_ife' AND restored = false"
@@ -564,7 +564,7 @@ mod tests {
     // Test 22: TRUNCATE on multiple tables in a single statement — all are captured
     #[pg_test]
     fn test_multi_table_truncate_captured() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_multi_a CASCADE").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_multi_b CASCADE").unwrap();
         Spi::run("CREATE TABLE test_multi_a (id int)").unwrap();
@@ -609,7 +609,7 @@ mod tests {
     // Test 23: DROP SCHEMA CASCADE captures tables inside the schema
     #[pg_test]
     fn test_drop_schema_cascade_captures_tables() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
         Spi::run("DROP SCHEMA IF EXISTS test_drop_schema CASCADE").unwrap();
         Spi::run("CREATE SCHEMA test_drop_schema").unwrap();
@@ -647,7 +647,7 @@ mod tests {
     // Test 24: Partitioned table IS captured with partition metadata in metadata JSON
     #[pg_test]
     fn test_partitioned_table_captured_with_metadata() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_part_parent CASCADE").unwrap();
         Spi::run(
@@ -695,7 +695,7 @@ mod tests {
     // Test 25: Multi-table DROP captures all tables
     #[pg_test]
     fn test_multi_table_drop_captured() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_multi_drop_a CASCADE").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_multi_drop_b CASCADE").unwrap();
         Spi::run("CREATE TABLE test_multi_drop_a (id int)").unwrap();
@@ -737,19 +737,19 @@ mod tests {
     // Test 26: Triggers on the captured table survive restore (they travel with the physical table)
     #[pg_test]
     fn test_trigger_survives_drop_restore() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_trigger_tbl CASCADE").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_trigger_log CASCADE").unwrap();
         Spi::run("CREATE TABLE test_trigger_tbl (id SERIAL, val text)").unwrap();
         Spi::run("CREATE TABLE test_trigger_log (logged_at timestamptz DEFAULT now())").unwrap();
         Spi::run(
-            "CREATE OR REPLACE FUNCTION _pg_flashback_trig_fn() RETURNS trigger LANGUAGE plpgsql AS \
+            "CREATE OR REPLACE FUNCTION _pg_recyclebin_trig_fn() RETURNS trigger LANGUAGE plpgsql AS \
              $$ BEGIN INSERT INTO test_trigger_log DEFAULT VALUES; RETURN NEW; END; $$"
         ).unwrap();
         Spi::run(
             "CREATE TRIGGER test_trigger_trig \
              AFTER INSERT ON test_trigger_tbl \
-             FOR EACH ROW EXECUTE FUNCTION _pg_flashback_trig_fn()"
+             FOR EACH ROW EXECUTE FUNCTION _pg_recyclebin_trig_fn()"
         ).unwrap();
         Spi::run("INSERT INTO test_trigger_tbl (val) VALUES ('before_drop')").unwrap();
 
@@ -780,14 +780,14 @@ mod tests {
         Spi::run("DROP TABLE IF EXISTS test_trigger_tbl CASCADE").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_trigger_log CASCADE").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
-        Spi::run("DROP FUNCTION IF EXISTS _pg_flashback_trig_fn() CASCADE").unwrap();
+        Spi::run("DROP FUNCTION IF EXISTS _pg_recyclebin_trig_fn() CASCADE").unwrap();
         Spi::run("DELETE FROM flashback.operations WHERE table_name = 'test_trigger_tbl'").unwrap();
     }
 
     // Test 27: FK constraints on OTHER tables referencing this table are captured in metadata
     #[pg_test]
     fn test_incoming_fk_captured_in_metadata() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_fk_child CASCADE").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_fk_parent CASCADE").unwrap();
         Spi::run("CREATE TABLE test_fk_parent (id SERIAL PRIMARY KEY, name text)").unwrap();
@@ -815,12 +815,12 @@ mod tests {
     }
 
     // Test 28b: Incoming FK constraints remain intact after DROP restore
-    // pg_flashback moves the parent via ALTER TABLE SET SCHEMA (not DROP), so the FK
+    // pg_recyclebin moves the parent via ALTER TABLE SET SCHEMA (not DROP), so the FK
     // is never dropped — it keeps pointing at the parent by OID throughout.
     // After restore the FK must still reference the correct parent in the correct schema.
     #[pg_test]
     fn test_incoming_fk_restored_end_to_end() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_fke_child CASCADE").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_fke_parent CASCADE").unwrap();
         Spi::run(
@@ -880,7 +880,7 @@ mod tests {
     // Test 28: RLS policies are captured in metadata and restored after DROP restore
     #[pg_test]
     fn test_rls_policy_captured_and_restored() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_rls_tbl CASCADE").unwrap();
         Spi::run("CREATE TABLE test_rls_tbl (id int, owner text)").unwrap();
         Spi::run("ALTER TABLE test_rls_tbl ENABLE ROW LEVEL SECURITY").unwrap();
@@ -922,7 +922,7 @@ mod tests {
     // Test 29: Partition children are restored (co-moved) when parent is restored
     #[pg_test]
     fn test_partitioned_children_restored_with_parent() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_part_restore_p CASCADE").unwrap();
         Spi::run(
@@ -972,7 +972,7 @@ mod tests {
     // Test 30: flashback_restore_schema restores all tables from a given schema
     #[pg_test]
     fn test_restore_schema_bulk() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
         Spi::run("DROP SCHEMA IF EXISTS test_bulk_schema CASCADE").unwrap();
         Spi::run("CREATE SCHEMA test_bulk_schema").unwrap();
@@ -1015,7 +1015,7 @@ mod tests {
     #[pg_test]
     #[should_panic]
     fn test_drop_nonexistent_table_errors() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_drop_real CASCADE").unwrap();
         Spi::run("CREATE TABLE test_drop_real (id int)").unwrap();
 
@@ -1027,7 +1027,7 @@ mod tests {
     // Test 32: DROP TABLE existing, non_existent WITH IF EXISTS should succeed silently
     #[pg_test]
     fn test_drop_nonexistent_with_if_exists_ok() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_drop_ifexists CASCADE").unwrap();
         Spi::run("CREATE TABLE test_drop_ifexists (id int)").unwrap();
@@ -1047,7 +1047,7 @@ mod tests {
     // Test 33: View with special-character name restores correctly (Bug 2 fix)
     #[pg_test]
     fn test_view_special_name_restore() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_view_base CASCADE").unwrap();
         Spi::run("CREATE TABLE test_view_base (id int, val text)").unwrap();
@@ -1075,7 +1075,7 @@ mod tests {
     // Test 34: flashback_purge_all returns actual purged count (Bug 4 fix)
     #[pg_test]
     fn test_purge_all_count() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_purge_a, test_purge_b CASCADE").unwrap();
         Spi::run("CREATE TABLE test_purge_a (id int)").unwrap();
@@ -1098,7 +1098,7 @@ mod tests {
     // Test 35: Restore with savepoint safety — second restore of same table fails gracefully (Bug 5)
     #[pg_test]
     fn test_restore_duplicate_name_fails_gracefully() {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_flashback").unwrap();
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_recyclebin").unwrap();
         Spi::run("SELECT flashback_purge_all()").unwrap();
         Spi::run("DROP TABLE IF EXISTS test_savepoint_tbl CASCADE").unwrap();
         Spi::run("CREATE TABLE test_savepoint_tbl (id int)").unwrap();

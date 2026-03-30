@@ -3,9 +3,9 @@ use pgrx::bgworkers::*;
 use std::time::Duration;
 
 pub fn register() {
-    BackgroundWorkerBuilder::new("pg_flashback cleanup worker")
+    BackgroundWorkerBuilder::new("pg_recyclebin cleanup worker")
         .set_function("flashback_cleanup_worker_main")
-        .set_library("pg_flashback")
+        .set_library("pg_recyclebin")
         .set_argument(None::<i32>.into_datum())
         .set_restart_time(Some(Duration::from_secs(5)))
         .enable_spi_access()
@@ -31,6 +31,7 @@ pub extern "C-unwind" fn flashback_cleanup_worker_main(_arg: pg_sys::Datum) {
 
         BackgroundWorker::transaction(|| {
             cleanup_expired_tables();
+            cleanup_old_history();
         });
     }
 
@@ -125,5 +126,77 @@ fn cleanup_expired_tables() {
 
     if let Err(e) = result {
         pgrx::warning!("Cleanup cycle failed: {}", e);
+    }
+}
+
+/// Delete rows from `flashback.row_history` that exceed the configured retention
+/// window or the absolute row-count cap.
+fn cleanup_old_history() {
+    let retention_hours = crate::guc::get_history_retention_hours();
+    let max_rows = crate::guc::get_max_history_rows();
+
+    let result: Result<(), spi::Error> = Spi::connect(|client| {
+        // Skip if the row_history table does not exist (e.g. old extension version).
+        let table_exists = client
+            .select(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM pg_class c \
+                    JOIN pg_namespace n ON n.oid = c.relnamespace \
+                    WHERE n.nspname = 'flashback' \
+                      AND c.relname = 'row_history' \
+                      AND c.relkind = 'r')",
+                None,
+                &[] as &[pgrx::datum::DatumWithOid],
+            )?
+            .first()
+            .get::<bool>(1)?
+            .unwrap_or(false);
+
+        if !table_exists {
+            return Ok(());
+        }
+
+        // 1. Purge rows older than the retention window.
+        let delete_old = format!(
+            "DELETE FROM flashback.row_history \
+             WHERE changed_at < now() - interval '{} hours'",
+            retention_hours
+        );
+        if let Err(e) = Spi::run(&delete_old) {
+            pgrx::warning!("pg_recyclebin: failed to purge old row_history rows: {}", e);
+        }
+
+        // 2. Trim to the row-count cap (delete oldest rows first).
+        let total: i64 = client
+            .select(
+                "SELECT COUNT(*)::bigint FROM flashback.row_history",
+                None,
+                &[] as &[pgrx::datum::DatumWithOid],
+            )?
+            .first()
+            .get::<i64>(1)?
+            .unwrap_or(0);
+
+        let excess = total - max_rows as i64;
+        if excess > 0 {
+            let trim_sql = format!(
+                "DELETE FROM flashback.row_history \
+                 WHERE id IN ( \
+                     SELECT id FROM flashback.row_history \
+                     ORDER BY changed_at ASC \
+                     LIMIT {} \
+                 )",
+                excess
+            );
+            if let Err(e) = Spi::run(&trim_sql) {
+                pgrx::warning!("pg_recyclebin: failed to trim row_history to cap: {}", e);
+            }
+        }
+
+        Ok(())
+    });
+
+    if let Err(e) = result {
+        pgrx::warning!("pg_recyclebin: row_history cleanup failed: {}", e);
     }
 }

@@ -21,9 +21,12 @@ pub struct ManifestFile {
     pub reference: Option<String>,
     pub bundle_id: Option<u64>,
     pub bundle_offset: Option<u64>,
-    /// Non-zero when pgBackRest 2.46+ block-level incremental is used.
-    /// Files with this set require block reassembly (Phase 5 — not yet supported).
+    /// Non-zero when pgBackRest 2.46+ block-level incremental is used (JSON key "bis").
+    /// Value = block_size / 8192 (factored).
     pub block_incr_size: Option<u64>,
+    /// Size of the block map appended at the end of the repo file (JSON key "bim").
+    /// Non-zero only when block_incr_size is also set.
+    pub block_incr_map_size: Option<u64>,
 }
 
 /// A database entry from the manifest [db] section.
@@ -95,12 +98,24 @@ impl BackupManifest {
             .map(|s| unquote(s).to_string())
             .filter(|s| !s.is_empty() && s != "null");
 
-        // [backup:option] section — compress type
-        let compress_type = ini
+        // [backup:option] section — compress type.
+        // Older pgBackRest versions (pre-2.38) omit option-compress-type but set
+        // option-compress=true to signal gzip compression.
+        let compress_type = if let Some(ct) = ini
             .get("backup:option")
             .and_then(|sec| sec.get("option-compress-type"))
-            .map(|s| CompressType::parse(unquote(s)))
-            .unwrap_or(CompressType::None);
+        {
+            CompressType::parse(super::unquote(ct))
+        } else if ini
+            .get("backup:option")
+            .and_then(|sec| sec.get("option-compress"))
+            .map(|v| super::unquote(v) == "true")
+            .unwrap_or(false)
+        {
+            CompressType::Gz
+        } else {
+            CompressType::None
+        };
 
         // [db] section — database name → OID mapping
         let mut databases = Vec::new();
@@ -136,10 +151,16 @@ impl BackupManifest {
                     .get("reference")
                     .and_then(|t| t.as_str())
                     .map(String::from);
-                // Bundle fields: pgBackRest uses short keys "bi" and "bof"
-                let bundle_id = v.get("bi").and_then(|t| t.as_u64());
-                let bundle_offset = v.get("bof").and_then(|t| t.as_u64());
-                let block_incr_size = v.get("bis").and_then(|t| t.as_u64());
+                // Bundle fields: pgBackRest uses short keys "bni" (bundle id) and "bno" (bundle offset)
+                let bundle_id = v.get("bni").and_then(|t| t.as_u64());
+                let bundle_offset = v.get("bno").and_then(|t| t.as_u64());
+                // Block-level incremental fields (pgBackRest 2.46+)
+                // "bi"  = blockIncrSize / 8192 (block size factor — set for all block-eligible files)
+                // "bic" = blockIncrChecksumSize
+                // "bim" = blockIncrMapSize (bytes of block map appended to the repo file — only
+                //         present when the file is actually stored with block-level incremental)
+                let block_incr_size = v.get("bi").and_then(|t| t.as_u64());
+                let block_incr_map_size = v.get("bim").and_then(|t| t.as_u64());
 
                 files.push(ManifestFile {
                     path: path.clone(),
@@ -151,6 +172,7 @@ impl BackupManifest {
                     bundle_id,
                     bundle_offset,
                     block_incr_size,
+                    block_incr_map_size,
                 });
             }
         }
@@ -234,9 +256,16 @@ impl BackupManifest {
             .collect()
     }
 
-    /// Check if any of the provided files use block-level incremental (unsupported).
+    /// Check if any of the provided files are actually stored with block-level incremental.
+    ///
+    /// A file has `block_incr_size` (`bi`) set merely because it is *eligible* for block-level
+    /// on future incremental backups.  A file is *actually* stored in block-level format only
+    /// when `block_incr_map_size` (`bim`) is also set and non-zero — that is when pgBackRest
+    /// appended a block map to the repo file and only changed 8 KB blocks were stored.
+    /// Only those files require the pgbackrest-restore fallback; plain-eligible files can be
+    /// extracted by our normal decompression path.
     pub fn has_block_incremental(files: &[&ManifestFile]) -> bool {
-        files.iter().any(|f| f.block_incr_size.unwrap_or(0) > 0)
+        files.iter().any(|f| f.block_incr_map_size.unwrap_or(0) > 0)
     }
 }
 

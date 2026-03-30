@@ -15,7 +15,7 @@ if ! command -v pg_config &>/dev/null; then
     exit 1
 fi
 
-SQL_FILE="$(pg_config --sharedir)/extension/pg_flashback--0.1.0.sql"
+SQL_FILE="$(pg_config --sharedir)/extension/pg_recyclebin--0.1.0.sql"
 
 cargo pgrx install
 
@@ -68,7 +68,7 @@ with open(path, "w") as f:
     f.writelines(result)
 PYEOF
 
-# Fix: add SECURITY DEFINER to all pg_flashback functions so non-superusers can call them
+# Fix: add SECURITY DEFINER to all pg_recyclebin functions so non-superusers can call them
 # (they need to access flashback schema which regular users don't have privileges on)
 sed -i '/flashback_restore_wrapper\|flashback_purge_wrapper\|flashback_list_recycled_tables_wrapper\|flashback_status_wrapper/{
     /SECURITY DEFINER/! {
@@ -107,7 +107,7 @@ elif command -v systemctl &>/dev/null && systemctl is-active --quiet postgresql 
     systemctl restart postgresql && echo "PostgreSQL restarted." || echo "systemctl restart failed — restart PostgreSQL manually."
 else
     echo "WARNING: Could not restart PostgreSQL automatically."
-    echo "         Please restart it manually before running CREATE EXTENSION pg_flashback."
+    echo "         Please restart it manually before running CREATE EXTENSION pg_recyclebin."
 fi
 
 if [ "$REINSTALL" = true ]; then
@@ -115,13 +115,13 @@ if [ "$REINSTALL" = true ]; then
     PSQL_DB="${PGDATABASE:-postgres}"
     PSQL_USER="${PGUSER:-postgres}"
     echo "Reinstalling extension (DROP CASCADE + CREATE)..."
-    "$PSQL_BIN" -U "$PSQL_USER" -d "$PSQL_DB" -c "DROP EXTENSION IF EXISTS pg_flashback CASCADE;" \
+    "$PSQL_BIN" -U "$PSQL_USER" -d "$PSQL_DB" -c "DROP EXTENSION IF EXISTS pg_recyclebin CASCADE;" \
         && echo "Old extension dropped." \
         || echo "WARNING: DROP EXTENSION failed — continuing anyway."
-    "$PSQL_BIN" -U "$PSQL_USER" -d "$PSQL_DB" -c "CREATE EXTENSION pg_flashback;" \
+    "$PSQL_BIN" -U "$PSQL_USER" -d "$PSQL_DB" -c "CREATE EXTENSION pg_recyclebin;" \
         && echo "Extension created." \
         || echo "ERROR: CREATE EXTENSION failed."
 else
-    echo "Run 'CREATE EXTENSION pg_flashback;' in psql to activate."
+    echo "Run 'CREATE EXTENSION pg_recyclebin;' in psql to activate."
     echo "For a fresh reinstall use: $0 --reinstall"
 fi

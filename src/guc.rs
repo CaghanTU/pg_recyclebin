@@ -17,6 +17,12 @@ static PGBACKREST_BIN_PATH: GucSetting<Option<CString>> = GucSetting::<Option<CS
 static PGBACKREST_PG_BIN_DIR: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 // Cipher pass: PGC_SUSET + GUC_SUPERUSER_ONLY + GUC_NOT_IN_SAMPLE to prevent key leakage
 static PGBACKREST_CIPHER_PASS: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+// Repo index: 1 = default. Set to 2, 3, … for multi-repo configs.
+static PGBACKREST_REPO: GucSetting<i32> = GucSetting::<i32>::new(1);
+
+// Row history GUCs
+static HISTORY_RETENTION_HOURS: GucSetting<i32> = GucSetting::<i32>::new(24);
+static MAX_HISTORY_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 
 pub fn register_gucs() {
     GucRegistry::define_int_guc(
@@ -75,7 +81,7 @@ pub fn register_gucs() {
     GucRegistry::define_string_guc(
         c"flashback.database_name",
         c"Database that the flashback cleanup background worker will connect to",
-        c"Set this to the name of the database where pg_flashback is installed. Defaults to 'postgres'.",
+        c"Set this to the name of the database where pg_recyclebin is installed. Defaults to 'postgres'.",
         &DATABASE_NAME,
         GucContext::Suset,
         GucFlags::default(),
@@ -102,7 +108,7 @@ pub fn register_gucs() {
 
     GucRegistry::define_string_guc(
         c"flashback.pgbackrest_temp_dir",
-        c"Temporary directory for pg_flashback backup restore operations",
+        c"Temporary directory for pg_recyclebin backup restore operations",
         c"A temporary PostgreSQL instance will be created here during single-table restore.",
         &PGBACKREST_TEMP_DIR,
         GucContext::Suset,
@@ -136,6 +142,40 @@ pub fn register_gucs() {
         // GUC_SUPERUSER_ONLY prevents non-superusers from reading via pg_settings.
         // NO_SHOW_ALL includes GUC_NOT_IN_SAMPLE — hides from SHOW ALL and postgresql.conf.sample.
         GucFlags::SUPERUSER_ONLY | GucFlags::NO_SHOW_ALL,
+    );
+
+    GucRegistry::define_int_guc(
+        c"flashback.pgbackrest_repo",
+        c"pgBackRest repository index to use (1-based)",
+        c"When multiple repos are configured, set this to the target repo number. Default: 1.",
+        &PGBACKREST_REPO,
+        1,
+        99,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // Row history GUCs
+    GucRegistry::define_int_guc(
+        c"flashback.history_retention_hours",
+        c"How many hours to keep row-level change history",
+        c"Rows in flashback.row_history older than this will be purged by the background worker.",
+        &HISTORY_RETENTION_HOURS,
+        1,
+        8760,  // 1 year max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"flashback.max_history_rows",
+        c"Maximum number of rows to keep in flashback.row_history",
+        c"When this limit is reached, the oldest rows are deleted first as a safety cap.",
+        &MAX_HISTORY_ROWS,
+        1000,
+        100_000_000,
+        GucContext::Suset,
+        GucFlags::default(),
     );
 }
 
@@ -195,7 +235,7 @@ pub fn get_pgbackrest_stanza() -> Option<String> {
 
 pub fn get_pgbackrest_temp_dir() -> String {
     cstring_guc_get(&PGBACKREST_TEMP_DIR)
-        .unwrap_or_else(|| "/tmp/pg_flashback_restore".to_string())
+        .unwrap_or_else(|| "/tmp/pg_recyclebin_restore".to_string())
 }
 
 pub fn get_pgbackrest_bin_path() -> String {
@@ -209,4 +249,16 @@ pub fn get_pgbackrest_pg_bin_dir() -> Option<String> {
 
 pub fn get_pgbackrest_cipher_pass() -> Option<String> {
     cstring_guc_get(&PGBACKREST_CIPHER_PASS)
+}
+
+pub fn get_pgbackrest_repo() -> i32 {
+    PGBACKREST_REPO.get()
+}
+
+pub fn get_history_retention_hours() -> i32 {
+    HISTORY_RETENTION_HOURS.get()
+}
+
+pub fn get_max_history_rows() -> i32 {
+    MAX_HISTORY_ROWS.get()
 }

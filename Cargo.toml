@@ -1,17 +1,17 @@
 [package]
-name = "pg_flashback"
+name = "pg_recyclebin"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/CaghanTU/pg_flashback"
+repository = "https://github.com/CaghanTU/pg_recyclebin"
 
 [lib]
-name = "pg_flashback"
+name = "pg_recyclebin"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "pgrx_embed_pg_flashback"
-path = "src/bin/pgrx_embed_pg_flashback.rs"
+name = "pgrx_embed_pg_recyclebin"
+path = "src/bin/pgrx_embed_pg_recyclebin.rs"
 
 [features]
 default = []

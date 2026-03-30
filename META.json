@@ -1,7 +1,7 @@
 {
-   "name": "pg_flashback",
+   "name": "pg_recyclebin",
    "abstract": "Recycle bin for PostgreSQL tables — intercepts DROP TABLE and TRUNCATE, lets you restore accidentally dropped data.",
-   "description": "pg_flashback is a PostgreSQL extension that acts as a recycle bin for table operations. When a DROP TABLE or TRUNCATE TABLE is executed, the extension captures the table (and its metadata including views, FK constraints, RLS policies, and partition structure) and stores it safely. You can restore by table name or by operation ID. Features include multi-table DROP support, quoted identifier handling, sequence/IDENTITY restore, background auto-purge, size/count limits, and a per-user permission model.",
+   "description": "pg_recyclebin is a PostgreSQL extension that acts as a recycle bin for table operations. When a DROP TABLE or TRUNCATE TABLE is executed, the extension captures the table (and its metadata including views, FK constraints, RLS policies, and partition structure) and stores it safely. You can restore by table name or by operation ID. Features include multi-table DROP support, quoted identifier handling, sequence/IDENTITY restore, background auto-purge, size/count limits, and a per-user permission model.",
    "version": "0.1.0",
    "maintainer": [
       "Caghan <https://github.com/CaghanTU>"
@@ -15,25 +15,25 @@
       }
    },
    "provides": {
-      "pg_flashback": {
+      "pg_recyclebin": {
          "abstract": "Recycle bin for PostgreSQL tables",
-         "file": "pg_flashback--0.1.0.sql",
+         "file": "pg_recyclebin--0.1.0.sql",
          "docfile": "README.md",
          "version": "0.1.0"
       }
    },
    "resources": {
-      "homepage": "https://github.com/CaghanTU/pg_flashback",
+      "homepage": "https://github.com/CaghanTU/pg_recyclebin",
       "bugtracker": {
-         "web": "https://github.com/CaghanTU/pg_flashback/issues"
+         "web": "https://github.com/CaghanTU/pg_recyclebin/issues"
       },
       "repository": {
-         "url": "https://github.com/CaghanTU/pg_flashback.git",
-         "web": "https://github.com/CaghanTU/pg_flashback",
+         "url": "https://github.com/CaghanTU/pg_recyclebin.git",
+         "web": "https://github.com/CaghanTU/pg_recyclebin",
          "type": "git"
       }
    },
-   "generated_by": "pg_flashback maintainer",
+   "generated_by": "pg_recyclebin maintainer",
    "meta-spec": {
       "version": "1.0.0",
       "url": "https://pgxn.org/meta/spec.txt"

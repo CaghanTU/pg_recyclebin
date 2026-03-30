@@ -28,39 +28,60 @@ impl TempInstance {
         pgbackrest_bin: &str,
         stanza: &str,
     ) -> Result<(), String> {
-        // Create recovery.signal (PG 12+)
+        // Create recovery.signal (PG 12+) only if not already present.
+        // pgbackrest restore writes it automatically; avoid overwriting it.
         let signal_path = self.data_dir.join("recovery.signal");
-        std::fs::write(&signal_path, "")
-            .map_err(|e| format!("write recovery.signal: {}", e))?;
+        if !signal_path.exists() {
+            std::fs::write(&signal_path, "")
+                .map_err(|e| format!("write recovery.signal: {}", e))?;
+        }
 
-        // Append recovery settings to postgresql.conf
+        // Overwrite postgresql.auto.conf so we replace any restore_command written
+        // by pgbackrest restore with our own LSN-targeted recovery config.
+        let auto_conf = self.data_dir.join("postgresql.auto.conf");
+        if auto_conf.exists() {
+            std::fs::write(&auto_conf, "# cleared by pg_recyclebin configure_recovery\n")
+                .map_err(|e| format!("clear postgresql.auto.conf: {}", e))?;
+        }
+
+        // Write a clean minimal postgresql.conf, replacing the backup's original.
+        // archive_mode=off avoids conflicts with the existing source cluster setup
+        // (pgBackRest enabled archiving there but our temp instance fetches WAL via
+        // restore_command directly, not through an archive).
         let conf_path = self.data_dir.join("postgresql.conf");
-        let recovery_conf = format!(
-            "\n# pg_flashback temp instance recovery\n\
-             restore_command = '{} --stanza={} archive-get %f %p'\n\
-             recovery_target_lsn = '{}'\n\
-             recovery_target_inclusive = true\n\
-             recovery_target_action = 'promote'\n",
-            pgbackrest_bin, stanza, target_lsn
+        let data_dir_str = self.data_dir.to_string_lossy();
+        // Pass --pg1-path to archive-get so pgBackRest can identify the correct
+        // stanza even though the data directory is a temporary path.
+        let restore_cmd = format!(
+            "{} --stanza={} --pg1-path={} archive-get %f %p",
+            pgbackrest_bin, stanza, data_dir_str
         );
+        // IMPORTANT: append to the backup's existing postgresql.conf rather than
+        // replacing it.  PostgreSQL enforces that several parameters (max_connections,
+        // max_prepared_transactions, max_worker_processes, max_locks_per_transaction)
+        // must be >= the values recorded in pg_control from the primary.  Replacing
+        // the conf would lose those values and abort recovery with "insufficient
+        // parameter settings".  Instead we keep the original values and only override
+        // what we need (port, archive_mode, logging, and recovery settings).
         let mut existing = std::fs::read_to_string(&conf_path).unwrap_or_default();
-        existing.push_str(&recovery_conf);
-
-        // Override resource-intensive settings for minimal footprint
         existing.push_str(&format!(
-            "\nport = {}\n\
+            "\n# pg_recyclebin temp instance (WAL replay) — appended, do not edit\n\
+             restore_command = '{restore_cmd}'\n\
+             recovery_target_lsn = '{target_lsn}'\n\
+             recovery_target_inclusive = true\n\
+             recovery_target_action = 'promote'\n\
+             port = {port}\n\
              shared_buffers = '32MB'\n\
              work_mem = '4MB'\n\
              maintenance_work_mem = '16MB'\n\
-             max_connections = 5\n\
-             wal_level = 'minimal'\n\
-             max_wal_senders = 0\n\
+             archive_mode = off\n\
              logging_collector = off\n\
              log_min_messages = 'warning'\n\
              listen_addresses = '127.0.0.1'\n",
-            self.port
+            restore_cmd = restore_cmd,
+            target_lsn = target_lsn,
+            port = self.port,
         ));
-
         std::fs::write(&conf_path, &existing)
             .map_err(|e| format!("write postgresql.conf: {}", e))
     }
@@ -72,6 +93,33 @@ impl TempInstance {
     /// the instance can start without needing the WAL segments referenced
     /// by the backup's pg_control file.
     pub fn configure_no_recovery(&self) -> Result<(), String> {
+        // Remove recovery.signal if present (pgbackrest restore writes it).
+        // pg_resetwal does not touch it, so we must remove it explicitly to
+        // prevent PostgreSQL from attempting WAL replay after reset.
+        let signal_path = self.data_dir.join("recovery.signal");
+        if signal_path.exists() {
+            std::fs::remove_file(&signal_path)
+                .map_err(|e| format!("remove recovery.signal: {}", e))?;
+        }
+
+        // Overwrite postgresql.auto.conf: pgbackrest restore writes restore_command
+        // there which would cause recovery mode even without recovery.signal.
+        let auto_conf = self.data_dir.join("postgresql.auto.conf");
+        if auto_conf.exists() {
+            std::fs::write(&auto_conf, "# cleared by pg_recyclebin configure_no_recovery\n")
+                .map_err(|e| format!("clear postgresql.auto.conf: {}", e))?;
+        }
+
+        // Remove backup_label: pgbackrest restore writes this file so PostgreSQL
+        // knows it is recovering from a backup.  Without recovery.signal it causes
+        // "could not locate required checkpoint record" at startup.  pg_resetwal
+        // below will create a fresh, valid checkpoint, making backup_label redundant.
+        let backup_label = self.data_dir.join("backup_label");
+        if backup_label.exists() {
+            std::fs::remove_file(&backup_label)
+                .map_err(|e| format!("remove backup_label: {}", e))?;
+        }
+
         // Reset WAL so PostgreSQL can start without the original WAL segments.
         // This is safe because we only need the data files, not crash recovery.
         let pg_resetwal = self.pg_bin_dir.join("pg_resetwal");
@@ -84,10 +132,12 @@ impl TempInstance {
             return Err(format!("pg_resetwal failed: {}", stderr));
         }
 
+        // Write a clean minimal postgresql.conf, completely replacing the backup's
+        // original one. This avoids conflicts with settings like archive_mode=on,
+        // restore_command, or wal_level constraints from the source cluster.
         let conf_path = self.data_dir.join("postgresql.conf");
-        let mut existing = std::fs::read_to_string(&conf_path).unwrap_or_default();
-        existing.push_str(&format!(
-            "\n# pg_flashback temp instance (no WAL replay)\n\
+        let minimal_conf = format!(
+            "# pg_recyclebin temp instance (no WAL replay) — generated, do not edit\n\
              port = {}\n\
              shared_buffers = '32MB'\n\
              work_mem = '4MB'\n\
@@ -95,13 +145,13 @@ impl TempInstance {
              max_connections = 5\n\
              wal_level = 'minimal'\n\
              max_wal_senders = 0\n\
+             archive_mode = off\n\
              logging_collector = off\n\
              log_min_messages = 'warning'\n\
              listen_addresses = '127.0.0.1'\n",
             self.port
-        ));
-
-        std::fs::write(&conf_path, &existing)
+        );
+        std::fs::write(&conf_path, &minimal_conf)
             .map_err(|e| format!("write postgresql.conf: {}", e))
     }
 
@@ -134,7 +184,7 @@ impl TempInstance {
     /// the calling backend to block forever on `pipe_read`.
     pub fn start(&mut self) -> Result<(), String> {
         let pg_ctl = self.pg_bin_dir.join("pg_ctl");
-        let log_path = self.data_dir.join("pg_flashback_startup.log");
+        let log_path = self.data_dir.join("pg_recyclebin_startup.log");
 
         let status = Command::new(&pg_ctl)
             .args([

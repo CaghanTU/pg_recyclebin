@@ -122,12 +122,26 @@ pub fn decompress(data: &[u8], compress_type: CompressType) -> Result<Vec<u8>, S
             zstd::decode_all(data).map_err(|e| format!("zstd decompress error: {}", e))
         }
         CompressType::Gz => {
-            let mut decoder = flate2::read::GzDecoder::new(data);
-            let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|e| format!("gzip decompress error: {}", e))?;
-            Ok(out)
+            // pgBackRest uses two gz sub-formats:
+            //   - Standalone files: standard gzip (magic 1F 8B) → GzDecoder
+            //   - Bundle-internal files: zlib deflate (magic 78 xx) → ZlibDecoder
+            // Detect by magic bytes and dispatch accordingly.
+            if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+                let mut decoder = flate2::read::GzDecoder::new(data);
+                let mut out = Vec::new();
+                decoder
+                    .read_to_end(&mut out)
+                    .map_err(|e| format!("gzip decompress error: {}", e))?;
+                Ok(out)
+            } else {
+                // zlib stream (0x78 0x9C / 0x78 0x01 / 0x78 0xDA)
+                let mut decoder = flate2::read::ZlibDecoder::new(data);
+                let mut out = Vec::new();
+                decoder
+                    .read_to_end(&mut out)
+                    .map_err(|e| format!("zlib decompress error: {}", e))?;
+                Ok(out)
+            }
         }
     }
 }
@@ -227,6 +241,47 @@ pub fn read_manifest_file_with_cipher(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Find a free TCP port starting from `start`, binding on 127.0.0.1.
+fn find_free_port(start: u16) -> u16 {
+    // Spread starting port by PID to avoid parallel restore collisions.
+    // Each backend has a unique PID; taking (pid % 1000) * 2 gives a spread
+    // of 0–1998, keeping us well within the ephemeral range.
+    let pid_offset = (std::process::id() % 1000) as u16 * 2;
+    let begin = start.saturating_add(pid_offset);
+    for port in begin..=65000 {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    // Fallback: scan from start
+    for port in start..begin {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    start
+}
+
+/// RAII guard that removes a directory on drop.
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                pgrx::warning!(
+                    "pg_recyclebin: failed to clean up temp dir {}: {}",
+                    self.0.display(), e
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public orchestration: single-table restore from pgBackRest backup
 // ---------------------------------------------------------------------------
 
@@ -281,6 +336,20 @@ pub fn restore_table_from_backup(
         .ok_or("flashback.pgbackrest_pg_bin_dir is not set")?;
     let cipher_pass = crate::guc::get_pgbackrest_cipher_pass();
 
+    // Early validation: catch empty required GUCs before doing any I/O
+    if repo_path_str.trim().is_empty() {
+        return Err("flashback.pgbackrest_repo_path is empty — set it to the pgBackRest repo root".to_string());
+    }
+    if stanza.trim().is_empty() {
+        return Err("flashback.pgbackrest_stanza is empty — set it to your pgBackRest stanza name".to_string());
+    }
+    if pg_bin_dir_str.trim().is_empty() {
+        return Err("flashback.pgbackrest_pg_bin_dir is empty — set it to the PostgreSQL bin directory (e.g. /usr/pgsql-17/bin)".to_string());
+    }
+    if pgbackrest_bin.trim().is_empty() {
+        return Err("flashback.pgbackrest_bin_path is empty — set it to the pgbackrest binary path (needed for restore_command)".to_string());
+    }
+
     let repo_path = PathBuf::from(&repo_path_str);
     let pg_bin_dir = PathBuf::from(&pg_bin_dir_str);
 
@@ -294,7 +363,7 @@ pub fn restore_table_from_backup(
         .clone();
 
     pgrx::log!(
-        "pg_flashback: restoring {}.{} from backup '{}' ({})",
+        "pg_recyclebin: restoring {}.{} from backup '{}' ({})",
         schema, table, selected.label, selected.backup_type
     );
 
@@ -321,18 +390,76 @@ pub fn restore_table_from_backup(
         ));
     }
 
-    // 5. Check for unsupported block-level incremental
-    if manifest::BackupManifest::has_block_incremental(&table_files) {
-        return Err(format!(
-            "table '{}.{}' uses pgBackRest block-level incremental (2.46+) — \
-             not yet supported. Restore from a full backup.",
-            schema, table
-        ));
+    // 5. Create temp directory. Append PID to the path so concurrent restore
+    //    calls (same backup label, different tables) don't collide.
+    let pid = std::process::id();
+    let temp_dir = PathBuf::from(format!(
+        "{}/{}_{}",
+        temp_base_dir, &selected.label, pid
+    ));
+    if temp_dir.exists() {
+        std::fs::remove_dir_all(&temp_dir)
+            .map_err(|e| format!("cleanup old temp dir: {}", e))?;
+    }
+    std::fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("create temp dir {}: {}", temp_dir.display(), e))?;
+    // Guard ensures temp_dir is removed on all return paths (success or error).
+    let _temp_guard = TempDirGuard(temp_dir.clone());
+
+    // 5b. Block-level incremental: check table_files AND all support files
+    // (global catalog, db catalog) together.  A global file with bim > 0 would
+    // fail the manual extractor just as much as a table file would.
+    let global_files_preview = bmanifest.find_global_files();
+    let catalog_files_preview = bmanifest.find_db_catalog_files(db_oid);
+    let all_files_for_check: Vec<&manifest::ManifestFile> = table_files
+        .iter()
+        .copied()
+        .chain(global_files_preview.iter().copied())
+        .chain(catalog_files_preview.iter().copied())
+        .collect();
+
+    if manifest::BackupManifest::has_block_incremental(&all_files_for_check) {
+        pgrx::log!(
+            "pg_recyclebin: block-level incremental detected for '{}.{}' in backup '{}' — \
+             delegating to pgbackrest restore subprocess",
+            schema, table, selected.label
+        );
+
+        // Resolve production connection params now (needed inside the helper)
+        let prod_port: u16 = Spi::get_one::<String>("SELECT current_setting('port')")
+            .unwrap_or(None)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(5432);
+        let prod_db = Spi::get_one::<String>("SELECT current_database()::text")
+            .unwrap_or(None)
+            .unwrap_or_else(|| "postgres".to_string());
+        let temp_db = bmanifest
+            .databases
+            .iter()
+            .find(|d| d.oid == db_oid)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "postgres".to_string());
+
+        return restore_via_pgbackrest(
+            schema,
+            table,
+            &temp_db,
+            &selected.label,
+            &stanza,
+            &pgbackrest_bin,
+            &pg_bin_dir,
+            &temp_dir,
+            skip_wal_replay,
+            &wal_lsn,
+            "127.0.0.1",
+            prod_port,
+            &prod_db,
+        );
     }
 
-    // 6. Gather catalog files needed for the temp PG instance
-    let global_files = bmanifest.find_global_files();
-    let catalog_files = bmanifest.find_db_catalog_files(db_oid);
+    // 6. Reuse the file lists already fetched for the block-incr check above.
+    let global_files = global_files_preview;
+    let catalog_files = catalog_files_preview;
 
     // 7. Resolve locations (handle reference chains for incr/diff)
     let all_files: Vec<&manifest::ManifestFile> = table_files
@@ -342,15 +469,7 @@ pub fn restore_table_from_backup(
         .collect();
     let locations = extractor::resolve_file_locations(&all_files, &selected.label);
 
-    // 8. Create temp directory and extract files
-    let temp_dir = PathBuf::from(format!("{}/{}", temp_base_dir, &selected.label));
-    if temp_dir.exists() {
-        std::fs::remove_dir_all(&temp_dir)
-            .map_err(|e| format!("cleanup old temp dir: {}", e))?;
-    }
-    std::fs::create_dir_all(&temp_dir)
-        .map_err(|e| format!("create temp dir {}: {}", temp_dir.display(), e))?;
-
+    // 8. Extract files into temp directory
     let extract_dest = temp_dir.join("pgdata");
     std::fs::create_dir_all(&extract_dest)
         .map_err(|e| format!("create extract dir: {}", e))?;
@@ -366,7 +485,7 @@ pub fn restore_table_from_backup(
 
     // 9. Create temp PG instance using extracted files
     let temp_pg_dir = temp_dir.join("pginstance");
-    let temp_port = 15432u16;
+    let temp_port = find_free_port(15432);
 
     // initdb to get a proper cluster structure
     let initdb = pg_bin_dir.join("initdb");
@@ -452,8 +571,113 @@ pub fn restore_table_from_backup(
         .map_err(|e| format!("cleanup temp dir: {}", e))?;
 
     pgrx::log!(
-        "pg_flashback: successfully restored {}.{} from backup '{}'",
+        "pg_recyclebin: successfully restored {}.{} from backup '{}'",
         schema, table, selected.label
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Block-level incremental fallback: use pgbackrest restore subprocess
+// ---------------------------------------------------------------------------
+
+/// Restore a single table from a block-level incremental backup by running
+/// `pgbackrest restore` to reconstruct the full data directory, then using
+/// the normal temp-instance + pg_dump/pg_restore path.
+///
+/// This avoids implementing the complex varint-128 block map format that
+/// pgBackRest 2.46+ uses. pgBackRest handles all assembly; we just start
+/// a temp instance on the result.
+#[allow(clippy::too_many_arguments)]
+fn restore_via_pgbackrest(
+    schema: &str,
+    table: &str,
+    temp_db: &str,
+    backup_label: &str,
+    stanza: &str,
+    pgbackrest_bin: &str,
+    pg_bin_dir: &Path,
+    temp_dir: &Path,
+    skip_wal_replay: bool,
+    wal_lsn: &str,
+    prod_host: &str,
+    prod_port: u16,
+    prod_db: &str,
+) -> Result<(), String> {
+    let temp_pg_dir = temp_dir.join("pginstance");
+    std::fs::create_dir_all(&temp_pg_dir)
+        .map_err(|e| format!("create pginstance dir: {}", e))?;
+
+    // Run pgbackrest restore into the temp directory.
+    // --db-include: restore ONLY the target database's files — critical for large
+    //   clusters: avoids copying every database in the cluster to the temp dir.
+    //   pgBackRest still restores global/ (pg_control, pg_xact, etc.) which are
+    //   required for the temp instance to start.
+    // --set: pick the specific backup set (avoids accidentally using latest).
+    // pgbackrest writes recovery.signal and sets up postgresql.auto.conf for recovery.
+    // Pass --repo=N when the user has configured a non-default repo index (e.g. repo2 for
+    // encrypted repos in a multi-repo pgBackRest setup).
+    let repo_idx = crate::guc::get_pgbackrest_repo();
+    let repo_arg = format!("--repo={}", repo_idx);
+
+    let restore_log = temp_dir.join("pgbackrest_restore.log");
+    let mut restore_args: Vec<String> = vec![
+        format!("--stanza={}", stanza),
+        format!("--pg1-path={}", temp_pg_dir.display()),
+        format!("--set={}", backup_label),
+        format!("--db-include={}", temp_db),
+        "--log-level-console=warn".to_string(),
+    ];
+    if repo_idx != 1 {
+        restore_args.push(repo_arg);
+    }
+    restore_args.push("restore".to_string());
+
+    let restore_status = std::process::Command::new(pgbackrest_bin)
+        .args(&restore_args)
+        .stdout(std::fs::File::create(&restore_log).ok().map_or(
+            std::process::Stdio::null(),
+            std::process::Stdio::from,
+        ))
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("pgbackrest restore: {}", e))?;
+
+    if !restore_status.status.success() {
+        let stderr = String::from_utf8_lossy(&restore_status.stderr);
+        return Err(format!(
+            "pgbackrest restore failed for backup '{}': {}",
+            backup_label, stderr.trim()
+        ));
+    }
+
+    pgrx::log!(
+        "pg_recyclebin: pgbackrest restore completed for backup '{}', starting temp instance",
+        backup_label
+    );
+
+    let temp_port = find_free_port(15432);
+    let mut instance = temp_instance::TempInstance::new(&temp_pg_dir, temp_port, pg_bin_dir);
+
+    if skip_wal_replay || wal_lsn.is_empty() {
+        // pgbackrest restore already wrote recovery.signal — pg_resetwal -f
+        // removes the WAL dependency so we can start without the archive.
+        instance.configure_no_recovery()?;
+    } else {
+        // Overwrite the recovery config written by pgbackrest with our LSN target.
+        // configure_recovery handles the case where recovery.signal already exists.
+        instance.configure_recovery(wal_lsn, pgbackrest_bin, stanza)?;
+    }
+
+    instance.start()?;
+    instance.wait_for_recovery(Duration::from_secs(300))?;
+
+    instance.dump_and_restore(temp_db, schema, table, prod_host, prod_port, prod_db)?;
+    instance.stop()?;
+
+    pgrx::log!(
+        "pg_recyclebin: successfully restored {}.{} from block-incremental backup '{}'",
+        schema, table, backup_label
     );
     Ok(())
 }
@@ -499,13 +723,13 @@ pub fn flashback_restore_from_backup(
     let is_superuser = unsafe { pg_sys::superuser_arg(pg_sys::GetSessionUserId()) };
     if !is_superuser {
         pgrx::warning!(
-            "pg_flashback: flashback_restore_from_backup() requires superuser privileges"
+            "pg_recyclebin: flashback_restore_from_backup() requires superuser privileges"
         );
         return false;
     }
 
     if table_name.contains('\'') || table_name.contains(';') {
-        pgrx::warning!("pg_flashback: invalid table name: {}", table_name);
+        pgrx::warning!("pg_recyclebin: invalid table name: {}", table_name);
         return false;
     }
 
@@ -543,8 +767,8 @@ pub fn flashback_restore_from_backup(
         Ok(v) if !v.is_empty() => v,
         _ => {
             pgrx::warning!(
-                "pg_flashback: no operation record found for '{}'. \
-                 Make sure the table was dropped after pg_flashback was installed.",
+                "pg_recyclebin: no operation record found for '{}'. \
+                 Make sure the table was dropped after pg_recyclebin was installed.",
                 table_name
             );
             return false;
@@ -553,7 +777,7 @@ pub fn flashback_restore_from_backup(
 
     // Use the first record that has relfilenode metadata.
     // restore_table_from_backup will skip records whose relfilenode isn't in the backup.
-    let (schema, metadata_json) = {
+    let (schema, _metadata_json) = {
         let with_relfnode: Vec<_> = candidates
             .iter()
             .filter(|(_, m)| {
@@ -565,7 +789,7 @@ pub fn flashback_restore_from_backup(
             .collect();
         if with_relfnode.is_empty() {
             pgrx::warning!(
-                "pg_flashback: metadata for '{}' does not contain relfilenode. \
+                "pg_recyclebin: metadata for '{}' does not contain relfilenode. \
                  Use flashback_backup_restore_hint('{}') for manual guidance.",
                 table_name, table_name
             );
@@ -594,12 +818,17 @@ pub fn flashback_restore_from_backup(
     for candidate_meta in &all_candidates_json {
         match restore_table_from_backup(restore_schema, table_name, candidate_meta, skip_wal_replay) {
             Ok(()) => {
-                let _ = Spi::run(&format!(
+                if let Err(e) = Spi::run(&format!(
                     "UPDATE flashback.operations \
                      SET restored = true, restored_at = now() \
                      WHERE table_name = '{}' AND restored = false",
                     table_name.replace('\'', "''")
-                ));
+                )) {
+                    pgrx::warning!(
+                        "pg_recyclebin: restored '{}' but failed to update operations log: {}",
+                        table_name, e
+                    );
+                }
                 return true;
             }
             Err(e) => {
@@ -609,14 +838,14 @@ pub fn flashback_restore_from_backup(
                     continue;
                 }
                 // Other errors are real failures
-                pgrx::warning!("pg_flashback: backup restore failed for '{}': {}", table_name, e);
+                pgrx::warning!("pg_recyclebin: backup restore failed for '{}': {}", table_name, e);
                 return false;
             }
         }
     }
 
     pgrx::warning!(
-        "pg_flashback: backup restore failed for '{}': no matching relfilenode found in backup. {}",
+        "pg_recyclebin: backup restore failed for '{}': no matching relfilenode found in backup. {}",
         table_name, last_error
     );
     false
@@ -660,7 +889,7 @@ pub fn flashback_backup_restore_hint(table_name: &str) -> String {
         _ => {
             return format!(
                 "No operation record found for '{}'. \
-                 Table must have been dropped while pg_flashback was installed.",
+                 Table must have been dropped while pg_recyclebin was installed.",
                 table_name
             );
         }

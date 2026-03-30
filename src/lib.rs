@@ -37,6 +37,38 @@ GRANT USAGE, CREATE ON SCHEMA flashback_recycle TO PUBLIC;
 ALTER TABLE flashback.operations ENABLE ROW LEVEL SECURITY;
 CREATE POLICY flashback_ops_own_rows ON flashback.operations
     USING (role_name = current_user);
+-- Row-level change history table
+CREATE TABLE IF NOT EXISTS flashback.row_history (
+    id          BIGSERIAL PRIMARY KEY,
+    changed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    schema_name TEXT NOT NULL,
+    table_name  TEXT NOT NULL,
+    operation   TEXT NOT NULL,
+    old_data    JSONB,
+    new_data    JSONB,
+    txid        BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_flashback_row_history_lookup
+    ON flashback.row_history (schema_name, table_name, changed_at);
+-- Shared trigger function used by all tracked tables
+CREATE OR REPLACE FUNCTION flashback.history_trigger_fn()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO flashback.row_history(schema_name, table_name, operation, old_data, new_data, txid)
+    VALUES (
+        TG_TABLE_SCHEMA,
+        TG_TABLE_NAME,
+        TG_OP,
+        CASE WHEN TG_OP IN ('UPDATE', 'DELETE') THEN row_to_json(OLD)::jsonb END,
+        CASE WHEN TG_OP IN ('UPDATE', 'INSERT') THEN row_to_json(NEW)::jsonb END,
+        txid_current()
+    );
+    RETURN NULL;
+END;
+$$;
+GRANT INSERT ON flashback.row_history TO PUBLIC;
+GRANT SELECT ON flashback.row_history TO PUBLIC;
+GRANT USAGE ON SEQUENCE flashback.row_history_id_seq TO PUBLIC;
 "#,
     name = "flashback_schema_setup",
     bootstrap
@@ -49,20 +81,21 @@ mod background_worker;
 pub mod guc;
 pub(crate) mod context;
 mod backup_restore;
+mod history;
 mod tests;
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     guc::register_gucs();
     hooks::install();
-    pgrx::log!("pg_flashback loaded");
+    pgrx::log!("pg_recyclebin loaded");
     background_worker::register();
 }
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_fini() {
     hooks::uninstall();
-    pgrx::log!("pg_flashback unloaded");
+    pgrx::log!("pg_recyclebin unloaded");
 }
 
 #[cfg(any(test, feature = "pg_test"))]

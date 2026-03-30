@@ -339,13 +339,13 @@ fn capture_drop_inner(schema: &str, bare_table: &str, cascade: bool) -> bool {
             if vn.is_empty() { continue; }
             let obj_type = if vk == "m" { "MATERIALIZED VIEW" } else { "VIEW" };
             let drop_sql = format!(
-                "DROP {} IF EXISTS \"{}\".\"{}\" CASCADE /* pg_flashback_internal */",
+                "DROP {} IF EXISTS \"{}\".\"{}\" CASCADE /* pg_recyclebin_internal */",
                 obj_type,
                 vs.replace('"', "\"\""),
                 vn.replace('"', "\"\"")
             );
             if let Err(e) = Spi::run(&drop_sql) {
-                pgrx::warning!("pg_flashback: failed to drop view '{}.{}': {}", vs, vn, e);
+                pgrx::warning!("pg_recyclebin: failed to drop view '{}.{}': {}", vs, vn, e);
             }
         }
     }
@@ -406,7 +406,7 @@ fn enforce_size_limit() {
                     FROM flashback.operations o \
                     JOIN LATERAL to_regclass(format('flashback_recycle.%I', o.recycled_name)) AS r(oid) ON true \
                     JOIN pg_class c ON c.oid = r.oid \
-                    WHERE o.restored = false";
+                    WHERE o.restored = false AND o.recycled_name IS NOT NULL";
     loop {
         if let Ok(Some(total_bytes)) = Spi::get_one::<i64>(size_sql) {
             let total_mb = total_bytes / (1024 * 1024);
@@ -515,9 +515,9 @@ pub fn handle_drop_table(tables: &[(String, String)], if_exists: bool, cascade: 
             // We'll issue a direct DROP for this table ourselves so PG doesn't error.
             let if_e  = if if_exists { "IF EXISTS " } else { "" };
             let casc  = if cascade   { " CASCADE"  } else { "" };
-            // pg_flashback_internal marker prevents the hook from re-intercepting this DROP.
+            // pg_recyclebin_internal marker prevents the hook from re-intercepting this DROP.
             skipped_drops.push(format!(
-                "DROP TABLE {}\"{}\".\"{}\"{} /* pg_flashback_internal */",
+                "DROP TABLE {}\"{}\".\"{}\"{} /* pg_recyclebin_internal */",
                 if_e,
                 schema.replace('"', "\"\""),
                 bare_table.replace('"', "\"\""),
@@ -531,7 +531,7 @@ pub fn handle_drop_table(tables: &[(String, String)], if_exists: bool, cascade: 
                 let if_e = if if_exists { "IF EXISTS " } else { "" };
                 let casc = if cascade   { " CASCADE"  } else { "" };
                 skipped_drops.push(format!(
-                    "DROP TABLE {}\"{}\".\"{}\"{} /* pg_flashback_internal */",
+                    "DROP TABLE {}\"{}\".\"{}\"{} /* pg_recyclebin_internal */",
                     if_e,
                     schema.replace('"', "\"\""),
                     bare_table.replace('"', "\"\""),
@@ -543,7 +543,7 @@ pub fn handle_drop_table(tables: &[(String, String)], if_exists: bool, cascade: 
 
     for drop_sql in &skipped_drops {
         if let Err(e) = Spi::run(drop_sql) {
-            pgrx::warning!("pg_flashback: fallback DROP failed: {}", e);
+            pgrx::warning!("pg_recyclebin: fallback DROP failed: {}", e);
         }
     }
 
@@ -673,7 +673,7 @@ pub fn handle_truncate_table(tables: &[(String, String)]) {
         if relpersistence == "t" { continue; }
         if relkind == "p" {
             pgrx::warning!(
-                "pg_flashback: '{}.{}' is a partitioned table — TRUNCATE capture skipped.",
+                "pg_recyclebin: '{}.{}' is a partitioned table — TRUNCATE capture skipped.",
                 schema, bare_table
             );
             continue;
@@ -744,7 +744,7 @@ pub fn handle_drop_schema_cascade(schema_name: &str) {
 
     if captured > 0 {
         pgrx::warning!(
-            "pg_flashback: captured {}/{} tables from DROP SCHEMA '{}'. \
+            "pg_recyclebin: captured {}/{} tables from DROP SCHEMA '{}'. \
              Use flashback_list_recycled_tables() to see them and flashback_restore() to recover.",
             captured, tables.len(), schema_name
         );

@@ -1,5 +1,5 @@
 #!/bin/bash
-# pg_flashback concurrent stress test
+# pg_recyclebin concurrent stress test
 # Tests that advisory locks prevent double-restore under concurrent load.
 
 PSQL="psql -U postgres -d postgres"

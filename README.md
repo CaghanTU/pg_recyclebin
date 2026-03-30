@@ -1,6 +1,6 @@
-# pg_flashback
+# pg_recyclebin
 
-A PostgreSQL extension that adds a **recycle bin** for dropped tables. Instead of permanently losing data when a `DROP TABLE` is executed, pg_flashback intercepts the command, moves the table to a safe schema, and lets you restore it later.
+A PostgreSQL extension that adds a **recycle bin** for dropped tables. Instead of permanently losing data when a `DROP TABLE` is executed, pg_recyclebin intercepts the command, moves the table to a safe schema, and lets you restore it later.
 
 > Built with [pgrx](https://github.com/pgcentralfoundation/pgrx) in Rust.
 
@@ -10,7 +10,7 @@ A PostgreSQL extension that adds a **recycle bin** for dropped tables. Instead o
 
 ```sql
 -- Enable extension
-CREATE EXTENSION pg_flashback;
+CREATE EXTENSION pg_recyclebin;
 
 -- Create test table
 CREATE TABLE test (id int);
@@ -72,11 +72,28 @@ SELECT * FROM test;
 
 ---
 
+## pgBackRest backup restore test matrix
+
+Tek tablo restore, diff zinciri, şifreli repo, FK / partition / inheritance ve **~10GB** veri yükü için otomatik/manuel senaryolar:
+
+- Dokümantasyon: [docs/BACKUP_RESTORE_TEST_MATRIX.md](docs/BACKUP_RESTORE_TEST_MATRIX.md)
+- Script: `scripts/backup_restore_test_matrix.sh` (+ `scripts/backup_restore_matrix.env.example`)
+
+```bash
+cp scripts/backup_restore_matrix.env.example scripts/backup_restore_matrix.env
+# PGHOST, PGPORT, PGDATABASE, stanza yollarını düzenle
+source scripts/backup_restore_matrix.env
+export PGFB_TARGET_GB=0.05   # hızlı; 10GB için PGFB_TARGET_GB=10
+./scripts/backup_restore_test_matrix.sh all
+```
+
+---
+
 ## Installation
 
 ```bash
-git clone https://github.com/CaghanTU/pg_flashback.git
-cd pg_flashback
+git clone https://github.com/CaghanTU/pg_recyclebin.git
+cd pg_recyclebin
 ./install.sh  # builds with pgrx and installs to PostgreSQL
 
 # Alternative (manual/pro)
@@ -88,7 +105,7 @@ cargo pgrx install --release
 1. Set `shared_preload_libraries` in `postgresql.conf`:
 
 ```conf
-shared_preload_libraries = 'pg_flashback'
+shared_preload_libraries = 'pg_recyclebin'
 ```
 
 Requires restart.
@@ -97,7 +114,7 @@ Requires restart.
 3. Extension is created in the target database:
 
 ```sql
-CREATE EXTENSION pg_flashback;
+CREATE EXTENSION pg_recyclebin;
 ```
 
 4. Optional but recommended for non-`postgres` databases: configure the worker connection DB.
@@ -272,7 +289,7 @@ All settings are adjustable at runtime without restarting PostgreSQL (requires s
 | `flashback.max_size` | `102400` (100 GB) | 1 – 1048576 MB | Maximum total size of the recycle bin |
 | `flashback.worker_interval_seconds` | `60` | 10 – 86400 | How often the cleanup worker runs |
 | `flashback.excluded_schemas` | *(empty)* | — | Comma-separated list of schemas to exclude |
-| `flashback.database_name` | `postgres` | — | Database the background worker connects to; set this when pg_flashback is installed in a database other than `postgres` |
+| `flashback.database_name` | `postgres` | — | Database the background worker connects to; set this when pg_recyclebin is installed in a database other than `postgres` |
 
 ### Examples
 
@@ -316,7 +333,7 @@ All public functions are `SECURITY DEFINER` so that regular users can access the
 
 ## TRUNCATE Support
 
-pg_flashback intercepts `TRUNCATE TABLE`: before the truncation runs, the current data is copied into a backup table in `flashback_recycle`. The actual `TRUNCATE` executes normally, leaving the table empty.
+pg_recyclebin intercepts `TRUNCATE TABLE`: before the truncation runs, the current data is copied into a backup table in `flashback_recycle`. The actual `TRUNCATE` executes normally, leaving the table empty.
 
 ```sql
 TRUNCATE TABLE orders;
@@ -331,7 +348,7 @@ SELECT * FROM orders;                            -- rows are back
 
 ## What Gets Skipped
 
-The following `DROP TABLE` commands are silently ignored by pg_flashback (the table is dropped normally):
+The following `DROP TABLE` commands are silently ignored by pg_recyclebin (the table is dropped normally):
 
 - Temporary tables (`CREATE TEMP TABLE ... DROP TABLE ...`)
 - Tables in the `flashback` or `flashback_recycle` schemas
@@ -342,7 +359,7 @@ The following `DROP TABLE` commands are silently ignored by pg_flashback (the ta
 
 ## Internal Schema
 
-pg_flashback creates two schemas on install:
+pg_recyclebin creates two schemas on install:
 
 - **`flashback`** — contains the `operations` metadata table and all public SQL functions
 - **`flashback_recycle`** — physical storage for dropped/truncated tables, named `<original_name>_<op_id>`
@@ -354,7 +371,7 @@ pg_flashback creates two schemas on install:
 - `flashback_purge` removes only the most recently dropped version; use `flashback_purge_by_id` to remove a specific version.
 - **TRUNCATE on large tables**: the backup is a full data copy (`CREATE TABLE ... AS SELECT *`). On very large tables this will consume additional disk space equal to the original table size and may take noticeable time. For tables in that size range consider excluding the schema via `flashback.excluded_schemas`.
 - **TRUNCATE restore constraints**: restoring a TRUNCATE entry requires the target table to still exist, and it fails if the table is currently referenced by incoming foreign keys from other tables.
-- When a partitioned table's child partitions are missing after restore (edge case: child was in a different schema that was also dropped), pg_flashback recreates the partition shell but the original data is gone — a `WARNING` is emitted.
+- When a partitioned table's child partitions are missing after restore (edge case: child was in a different schema that was also dropped), pg_recyclebin recreates the partition shell but the original data is gone — a `WARNING` is emitted.
 - Materialized views dependent on a dropped table are dropped along with it (on `CASCADE`) and recreated from captured definitions on restore. Mview-specific runtime state (for example last refresh timing/history) is not preserved.
 
 ---

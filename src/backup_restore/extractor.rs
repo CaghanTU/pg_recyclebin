@@ -68,9 +68,10 @@ pub fn extract_files(
     for loc in locations {
         let entry = &loc.manifest_entry;
 
-        if entry.block_incr_size.unwrap_or(0) > 0 {
+        if entry.block_incr_map_size.unwrap_or(0) > 0 {
             return Err(format!(
-                "block-level incremental not supported for file '{}' (pgBackRest 2.46+ feature, Phase 5)",
+                "block-level incremental file '{}' reached extractor — \
+                 should have been handled by restore_via_pgbackrest()",
                 entry.path
             ));
         }

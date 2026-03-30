@@ -44,7 +44,7 @@ fn rename_indexes_back(schema: &str, table: &str, recycled_name: &str) {
                 qi(schema), qi(idx), qi(orig)
             )) {
                 pgrx::warning!(
-                    "pg_flashback: failed to rename index '{}' back to '{}': {}",
+                    "pg_recyclebin: failed to rename index '{}' back to '{}': {}",
                     idx, orig, e
                 );
             }
@@ -87,7 +87,7 @@ fn rename_sequences_back(schema: &str, table: &str, recycled_name: &str) {
                 qi(schema), qi(seq), qi(orig)
             )) {
                 pgrx::warning!(
-                    "pg_flashback: failed to rename sequence '{}' back to '{}': {}",
+                    "pg_recyclebin: failed to rename sequence '{}' back to '{}': {}",
                     seq, orig, e
                 );
             }
@@ -122,7 +122,7 @@ fn find_serial_sequences(schema: &str, table: &str) -> Vec<(String, String)> {
         Ok::<_, pgrx::spi::Error>(())
     });
     if let Err(e) = result {
-        pgrx::warning!("pg_flashback: find_serial_sequences error: {:?}", e);
+        pgrx::warning!("pg_recyclebin: find_serial_sequences error: {:?}", e);
     }
     cols
 }
@@ -178,11 +178,11 @@ fn restore_from_metadata(metadata_json: &str, table_name: &str, restore_schema: 
 
             if let Err(e) = Spi::run(&create_sql) {
                 pgrx::warning!(
-                    "pg_flashback: failed to recreate view '{}.{}' for '{}': {}",
+                    "pg_recyclebin: failed to recreate view '{}.{}' for '{}': {}",
                     view_schema, view_name, table_name, e
                 );
             } else {
-                pgrx::log!("pg_flashback: recreated view '{}.{}' for '{}'", view_schema, view_name, table_name);
+                pgrx::log!("pg_recyclebin: recreated view '{}.{}' for '{}'", view_schema, view_name, table_name);
             }
         }
     }
@@ -201,7 +201,7 @@ fn restore_from_metadata(metadata_json: &str, table_name: &str, restore_schema: 
                 constraint_q
             };
 
-            // When pg_flashback captures a DROP by moving the table via SET SCHEMA,
+            // When pg_recyclebin captures a DROP by moving the table via SET SCHEMA,
             // the FK constraint on the child is preserved (it references by OID).
             // Skip re-adding if it already exists — this is the normal case.
             let already_exists = Spi::get_one::<bool>(&format!(
@@ -211,7 +211,7 @@ fn restore_from_metadata(metadata_json: &str, table_name: &str, restore_schema: 
 
             if already_exists {
                 pgrx::log!(
-                    "pg_flashback: FK constraint '{}' already exists on child table — skipping re-add",
+                    "pg_recyclebin: FK constraint '{}' already exists on child table — skipping re-add",
                     bare_name
                 );
                 continue;
@@ -219,11 +219,11 @@ fn restore_from_metadata(metadata_json: &str, table_name: &str, restore_schema: 
 
             if let Err(e) = Spi::run(def) {
                 pgrx::warning!(
-                    "pg_flashback: failed to restore FK constraint for '{}': {}",
+                    "pg_recyclebin: failed to restore FK constraint for '{}': {}",
                     table_name, e
                 );
             } else {
-                pgrx::log!("pg_flashback: restored FK constraint for '{}'", table_name);
+                pgrx::log!("pg_recyclebin: restored FK constraint for '{}'", table_name);
             }
         }
     }
@@ -266,11 +266,11 @@ fn restore_from_metadata(metadata_json: &str, table_name: &str, restore_schema: 
                 );
                 if let Err(e) = Spi::run(&policy_sql) {
                     pgrx::warning!(
-                        "pg_flashback: failed to restore RLS policy '{}' for '{}': {}",
+                        "pg_recyclebin: failed to restore RLS policy '{}' for '{}': {}",
                         name, table_name, e
                     );
                 } else {
-                    pgrx::log!("pg_flashback: restored RLS policy '{}' for '{}'", name, table_name);
+                    pgrx::log!("pg_recyclebin: restored RLS policy '{}' for '{}'", name, table_name);
                 }
             }
         }
@@ -341,7 +341,7 @@ fn restore_partition_info_from_metadata(metadata_json: &str, table_name: &str, r
         if exists {
             co_moved += 1;
             pgrx::log!(
-                "pg_flashback: child partition {}.{} co-moved with parent '{}'",
+                "pg_recyclebin: child partition {}.{} co-moved with parent '{}'",
                 child_schema_q, child_name_q, table_name
             );
             continue;
@@ -355,7 +355,7 @@ fn restore_partition_info_from_metadata(metadata_json: &str, table_name: &str, r
             Ok(_) => {
                 created += 1;
                 pgrx::warning!(
-                    "pg_flashback: recreated empty partition {}.{} for '{}' — \
+                    "pg_recyclebin: recreated empty partition {}.{} for '{}' — \
                      original data was lost when the parent was dropped. Restore from backup if needed.",
                     child_schema_q, child_name_q, table_name
                 );
@@ -363,7 +363,7 @@ fn restore_partition_info_from_metadata(metadata_json: &str, table_name: &str, r
             Err(e) => {
                 failed += 1;
                 pgrx::warning!(
-                    "pg_flashback: could not recreate partition {}.{} for '{}': {}. \
+                    "pg_recyclebin: could not recreate partition {}.{} for '{}': {}. \
                      Recreate manually: {}",
                     child_schema_q, child_name_q, table_name, e, create_sql
                 );
@@ -373,14 +373,14 @@ fn restore_partition_info_from_metadata(metadata_json: &str, table_name: &str, r
 
     if failed > 0 {
         pgrx::warning!(
-            "pg_flashback: '{}' {} partitioned table — {}/{} partitions OK, {} failed. \
+            "pg_recyclebin: '{}' {} partitioned table — {}/{} partitions OK, {} failed. \
              See warnings above.",
             table_name, strategy,
             co_moved + created, children.len(), failed
         );
     } else {
         pgrx::log!(
-            "pg_flashback: '{}' {} partitioned table — {}/{} partitions OK \
+            "pg_recyclebin: '{}' {} partitioned table — {}/{} partitions OK \
              ({} co-moved, {} recreated as empty shells)",
             table_name, strategy,
             co_moved + created, children.len(), co_moved, created
@@ -456,12 +456,12 @@ fn perform_restore(
         // For DROP operations, auto-create the missing schema so the table can be restored.
         if let Err(e) = Spi::run(&format!("CREATE SCHEMA {}", qi(restore_schema))) {
             pgrx::warning!(
-                "pg_flashback: could not create schema '{}': {}",
+                "pg_recyclebin: could not create schema '{}': {}",
                 restore_schema, e
             );
             return false;
         }
-        pgrx::log!("pg_flashback: created schema '{}' for restore", restore_schema);
+        pgrx::log!("pg_recyclebin: created schema '{}' for restore", restore_schema);
     }
 
     if operation_type == "TRUNCATE" {
@@ -720,7 +720,7 @@ fn try_backup_restore_fallback(table_name: &str, target_schema: Option<&str>) ->
         Ok(Some((schema, meta))) if !meta.is_empty() => {
             let restore_schema = target_schema.unwrap_or(&schema);
             pgrx::warning!(
-                "pg_flashback: '{}' not in recycle bin — attempting pgBackRest backup restore",
+                "pg_recyclebin: '{}' not in recycle bin — attempting pgBackRest backup restore",
                 table_name
             );
             match crate::backup_restore::restore_table_from_backup(
@@ -740,7 +740,7 @@ fn try_backup_restore_fallback(table_name: &str, target_schema: Option<&str>) ->
                 }
                 Err(e) => {
                     pgrx::warning!(
-                        "pg_flashback: backup restore failed for '{}': {}",
+                        "pg_recyclebin: backup restore failed for '{}': {}",
                         table_name,
                         e
                     );
@@ -1048,7 +1048,7 @@ fn flashback_status() -> TableIterator<
             FROM flashback.operations o \
             JOIN LATERAL to_regclass(format('flashback_recycle.%I', o.recycled_name)) AS r(oid) ON true \
             JOIN pg_class c ON c.oid = r.oid \
-            WHERE o.restored = false",
+            WHERE o.restored = false AND o.recycled_name IS NOT NULL",
     )
     .unwrap_or(Some(0))
     .unwrap_or(0);
@@ -1096,12 +1096,12 @@ fn flashback_restore_schema(schema_name: &str, target_schema: Option<&str>) -> i
 
     // SQL injection protection
     if schema_name.contains('\'') || schema_name.contains(';') {
-        pgrx::warning!("pg_flashback: invalid schema name: {}", schema_name);
+        pgrx::warning!("pg_recyclebin: invalid schema name: {}", schema_name);
         return 0;
     }
     if let Some(s) = target_schema {
         if s.contains('\'') || s.contains(';') {
-            pgrx::warning!("pg_flashback: invalid target schema: {}", s);
+            pgrx::warning!("pg_recyclebin: invalid target schema: {}", s);
             return 0;
         }
     }
@@ -1129,7 +1129,7 @@ fn flashback_restore_schema(schema_name: &str, target_schema: Option<&str>) -> i
 
     if op_ids.is_empty() {
         pgrx::warning!(
-            "pg_flashback: no tables found in recycle bin for schema '{}'",
+            "pg_recyclebin: no tables found in recycle bin for schema '{}'",
             schema_name
         );
         return 0;
@@ -1146,12 +1146,12 @@ fn flashback_restore_schema(schema_name: &str, target_schema: Option<&str>) -> i
     if !schema_exists {
         if let Err(e) = Spi::run(&format!("CREATE SCHEMA {}", qi(effective_schema))) {
             pgrx::warning!(
-                "pg_flashback: could not create schema '{}': {}",
+                "pg_recyclebin: could not create schema '{}': {}",
                 effective_schema, e
             );
             return 0;
         }
-        pgrx::log!("pg_flashback: created schema '{}' for restore", effective_schema);
+        pgrx::log!("pg_recyclebin: created schema '{}' for restore", effective_schema);
     }
 
     let total = op_ids.len() as i64;
@@ -1163,7 +1163,7 @@ fn flashback_restore_schema(schema_name: &str, target_schema: Option<&str>) -> i
     }
 
     pgrx::log!(
-        "pg_flashback: schema restore '{}': {}/{} tables restored",
+        "pg_recyclebin: schema restore '{}': {}/{} tables restored",
         schema_name, restored_count, total
     );
     restored_count
@@ -1263,7 +1263,7 @@ fn flashback_restore_all() -> i64 {
             )).unwrap_or(None).unwrap_or(false);
             if !exists {
                 if let Err(e) = Spi::run(&format!("CREATE SCHEMA {}", qi(schema))) {
-                    pgrx::warning!("pg_flashback: restore_all: could not create schema '{}': {}", schema, e);
+                    pgrx::warning!("pg_recyclebin: restore_all: could not create schema '{}': {}", schema, e);
                 }
             }
         }
@@ -1276,6 +1276,6 @@ fn flashback_restore_all() -> i64 {
         }
     }
 
-    pgrx::log!("pg_flashback: restore_all: {}/{} tables restored", restored_count, total);
+    pgrx::log!("pg_recyclebin: restore_all: {}/{} tables restored", restored_count, total);
     restored_count
 }
